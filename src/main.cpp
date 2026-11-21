@@ -760,6 +760,10 @@ struct Arena {
     cap = (bytes + 4095) & ~(size_t)4095;
     void* m = mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (m == MAP_FAILED) die("mmap arena");
+    if (((uintptr_t)m + cap) >> 48) {  // the dedup table packs record pointers into 48 bits
+      errno = 0;
+      die("arena above the 48-bit address range");
+    }
 #ifdef MADV_HUGEPAGE
     madvise(m, cap, MADV_HUGEPAGE);
 #endif
@@ -785,8 +789,12 @@ struct BList {
   Block* tail = nullptr;
   size_t total = 0;
   inline void push(const T& v, Arena& a) {
+    push_with(v, [&]() { return a.alloc(sizeof(Block)); });
+  }
+  template <class Alloc>
+  inline void push_with(const T& v, Alloc&& alloc) {
     if (!tail || tail->n == BLK) {
-      Block* b = (Block*)a.alloc(sizeof(Block));
+      Block* b = (Block*)alloc();
       b->next = nullptr;
       b->n = 0;
       if (tail)
@@ -802,6 +810,11 @@ struct BList {
   template <class F>
   inline void each(F&& f) const {
     for (const Block* b = head; b; b = b->next)
+      for (u32 i = 0; i < b->n; i++) f(b->items[i]);
+  }
+  template <class F>
+  inline void each_mut(F&& f) {
+    for (Block* b = head; b; b = b->next)
       for (u32 i = 0; i < b->n; i++) f(b->items[i]);
   }
 };
@@ -1252,7 +1265,9 @@ int main() {
   u32* nameof = nullptr;  // name slot + 1 for linked roots, 0 = self
   typedef BList<EvRec, 500> EvList;
   typedef BList<ClRec, 500> ClList;
-  typedef BList<SEv, 1300> SList;
+  typedef BList<SEv, 1000> SList;
+  // dedup writes survivors into the event blocks it has finished reading
+  static_assert(sizeof(SList::Block) <= sizeof(EvList::Block), "SList block must fit in an EvList block");
   vector<vector<EvList>> evp;
   vector<vector<ClList>> clp;
   vector<Arena> arenas(NT);
@@ -1532,35 +1547,81 @@ int main() {
   vector<Arena> sarenas(NT);
   for (auto& a : sarenas) a.init(evbytes / 4 + (16 << 20));
   {
-    vector<vector<const EvRec*>> tabs(NT);
+    // Table slot: record pointer << 16 | 16 tag bits from h2, so a probe only dereferences a
+    // record on a likely copy. A losing copy is marked in place (pc = 0), and survivors are then
+    // emitted by a sequential pass over the records instead of a random walk through the table.
+    vector<vector<u64>> tabs(NT);
+    vector<vector<void*>> freeblk(NT);
     parallel(PE, [&](int p, int t) {
       size_t n = 0;
       for (int k = 0; k < NT; k++) n += evp[k][p].size();
       size_t sz = 16;
       while (sz < n * 2) sz <<= 1;
       auto& tab = tabs[t];
-      tab.assign(sz, nullptr);
-      u64 m = sz - 1;
+      tab.assign(sz, 0);
+      const u64 m = sz - 1;
+      u64* tb = tab.data();
+      constexpr u32 PF = 16;  // table-slot prefetch distance
       for (int k = 0; k < NT; k++)
-        evp[k][p].each([&](const EvRec& r) {
-          u64 idx = r.hlo & m;
-          for (;;) {
-            const EvRec* q = tab[idx];
-            if (!q) {
-              tab[idx] = &r;
-              break;
+        for (EvList::Block* b = evp[k][p].head; b; b = b->next) {
+          EvRec* it = b->items;
+          const u32 bn = b->n;
+          for (u32 i = 0; i < bn && i < PF; i++) __builtin_prefetch(&tb[it[i].hlo & m]);
+          for (u32 i = 0; i < bn; i++) {
+            if (i + PF < bn) __builtin_prefetch(&tb[it[i + PF].hlo & m]);
+            EvRec& r = it[i];
+            const u64 tag = r.h2 & 0xFFFF;
+            u64 idx = r.hlo & m;
+            for (;;) {
+              const u64 e = tb[idx];
+              if (!e) {
+                tb[idx] = ((u64)(uintptr_t)&r << 16) | tag;
+                break;
+              }
+              if ((e & 0xFFFF) == tag) {
+                EvRec* q = (EvRec*)(uintptr_t)(e >> 16);
+                if (q->hlo == r.hlo && q->h2 == r.h2) {
+                  if (r.ing < q->ing) {  // equal ingest: identical copies, keep the first
+                    q->pc = 0;
+                    tb[idx] = ((u64)(uintptr_t)&r << 16) | tag;
+                  } else {
+                    r.pc = 0;
+                  }
+                  break;
+                }
+              }
+              idx = (idx + 1) & m;
             }
-            if (q->hlo == r.hlo && q->h2 == r.h2) {
-              if (r.ing < q->ing) tab[idx] = &r;
-              break;
-            }
-            idx = (idx + 1) & m;
           }
-        });
+        }
+      // Survivors go into the event blocks already read (a block holds as many bytes of SEv as
+      // of EvRec, and survivors are half the size), so this pass barely touches fresh memory.
       auto& out = sp[t];
       Arena& ar = sarenas[t];
-      for (const EvRec* q : tab)
-        if (q && q->pc) out[q->person >> PSH].push(SEv{q->ts_rel, q->pc, q->person}, ar);
+      vector<void*>& fr = freeblk[t];
+      auto alloc = [&]() -> void* {
+        if (!fr.empty()) {
+          void* x = fr.back();
+          fr.pop_back();
+          return x;
+        }
+        return ar.alloc(sizeof(EvList::Block));
+      };
+      for (int k = 0; k < NT; k++) {
+        EvList::Block* b = evp[k][p].head;
+        while (b) {
+          EvList::Block* nx = b->next;
+          const EvRec* it = b->items;
+          const u32 bn = b->n;
+          for (u32 i = 0; i < bn; i++) {
+            const EvRec& q = it[i];
+            if (q.pc) out[q.person >> PSH].push_with(SEv{q.ts_rel, q.pc, q.person}, alloc);
+          }
+          fr.push_back(b);
+          b = nx;
+        }
+        evp[k][p].head = evp[k][p].tail = nullptr;
+      }
     });
   }
   logt("dedup");
