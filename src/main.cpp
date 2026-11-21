@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,20 +42,75 @@ static void logt(const char* what) {
   exit(1);
 }
 
+// Persistent worker pool: NT-1 threads started once, woken per phase (futex via atomic wait).
+// Avoids per-phase thread creation and keeps thread-local scratch buffers alive across phases.
+struct Pool {
+  std::atomic<u32> gen{0};
+  std::atomic<int> done{0};
+  void (*fn)(void*, int) = nullptr;
+  void* ctx = nullptr;
+  int nw = 0;
+  void start(int nt) {
+    nw = nt - 1;
+    for (int t = 1; t < nt; t++) std::thread([this, t] { loop(t); }).detach();
+  }
+  void loop(int t) {
+    u32 seen = 0;
+    for (;;) {
+      u32 g;
+      while ((g = gen.load(std::memory_order_acquire)) == seen) gen.wait(seen, std::memory_order_acquire);
+      seen = g;
+      fn(ctx, t);
+      if (done.fetch_add(1, std::memory_order_acq_rel) + 1 == nw) done.notify_one();
+    }
+  }
+  void run(void (*f)(void*, int), void* c) {
+    fn = f;
+    ctx = c;
+    done.store(0, std::memory_order_relaxed);
+    gen.fetch_add(1, std::memory_order_release);
+    gen.notify_all();
+    f(c, 0);
+    int d;
+    while ((d = done.load(std::memory_order_acquire)) != nw) done.wait(d, std::memory_order_acquire);
+  }
+};
+static Pool g_pool;
+
 template <class F>
 static void parallel(int n, F&& f) {
-  std::atomic<int> next{0};
-  auto body = [&](int t) {
-    for (;;) {
-      int i = next.fetch_add(1, std::memory_order_relaxed);
-      if (i >= n) break;
-      f(i, t);
-    }
-  };
-  vector<std::thread> th;
-  for (int t = 1; t < NT; t++) th.emplace_back(body, t);
-  body(0);
-  for (auto& x : th) x.join();
+  struct Ctx {
+    std::atomic<int> next{0};
+    int n;
+    F* f;
+  } c;
+  c.n = n;
+  c.f = &f;
+  g_pool.run(
+      [](void* p, int t) {
+        Ctx& c = *(Ctx*)p;
+        for (;;) {
+          int i = c.next.fetch_add(1, std::memory_order_relaxed);
+          if (i >= c.n) break;
+          (*c.f)(i, t);
+        }
+      },
+      &c);
+}
+
+// Write-touch fresh anonymous memory in parallel. A table whose first access is a read gets the
+// shared huge zero page, and the later write faults then split it into 4 KB pages; touching by
+// writing first keeps it on 2 MB pages (fewer TLB misses for random lookups) and moves the
+// zeroing off the critical path of the first phase that uses it.
+static bool g_prefault = true;
+static void prefault(void* p, size_t bytes) {
+  if (!g_prefault) return;
+  const size_t per = ((bytes / NT) + 4095) & ~(size_t)4095;
+  parallel(NT, [&](int i, int) {
+    char* b = (char*)p + (size_t)i * per;
+    char* e = std::min((char*)p + bytes, b + per);
+    for (char* x = b; x < e; x += 4096) *(volatile char*)x = 0;
+  });
 }
 
 // ---------------------------------------------------------------- hashing
@@ -243,22 +299,31 @@ static inline void scan_lines(const char* b, const char* e, F&& on) {
 // Two-pass variant for large chunks. Pass 1 flattens all separator (comma/newline) offsets
 // branchlessly, plus newline offsets with the running quote count. Pass 2 walks lines: a line
 // has exactly N fields iff its (N-1)th following separator is its own newline.
+// Per-thread scratch (persistent pool threads): raw, uninitialized, huge-page advised.
 struct ScanBuf {
-  vector<u32> seps, nls, qc;
+  u32* mem = nullptr;
+  size_t cap = 0;  // entries per array
+  void ensure(size_t n) {
+    if (cap >= n) return;
+    if (mem) munmap(mem, cap * 12);
+    cap = std::max<size_t>(n, 300 << 10);
+    void* m = mmap(nullptr, cap * 12, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) die("mmap scan");
+#ifdef MADV_HUGEPAGE
+    madvise(m, cap * 12, MADV_HUGEPAGE);
+#endif
+    mem = (u32*)m;
+  }
 };
 static thread_local ScanBuf t_scan;
 template <int N, class F>
 static inline void scan_lines2(const char* b, const char* e, F&& on) {
   const size_t n = (size_t)(e - b);
   ScanBuf& sb = t_scan;
-  if (sb.seps.size() < n + 128) {
-    sb.seps.resize(n + 128);
-    sb.nls.resize(n + 128);
-    sb.qc.resize(n + 128);
-  }
-  u32* seps = sb.seps.data();
-  u32* nls = sb.nls.data();
-  u32* qc = sb.qc.data();
+  sb.ensure(n + 128);
+  u32* seps = sb.mem;
+  u32* nls = sb.mem + sb.cap;
+  u32* qc = sb.mem + 2 * sb.cap;
   size_t ns = 0, nn = 0;
   u32 qcum = 0;
   alignas(64) char tail[64];
@@ -569,45 +634,55 @@ static string read_all(const string& path) {
   return s;
 }
 
-// A chunk of complete lines: [b, e), every line ends with '\n' and e is just past one.
+// A byte range [off, end) of a file. Line boundaries are found by the worker that processes it,
+// so setup touches no file data: the chunk owns every line that starts inside its range
+// (the header line, starting at 0, is skipped).
 struct Chunk {
-  const char* b;
-  const char* e;
+  const char* base;
+  size_t fsize;
+  size_t off, end;
   int kind;  // 0 links, 1 events, 2 clicks
 };
-static vector<char*> g_tails;  // owned copies of final lines lacking '\n'
 
 static void make_chunks(const File& f, int kind, size_t target, vector<Chunk>& out) {
   if (!f.size) return;
-  const char* base = f.data;
-  const char* end = base + f.size;
-  const char* nl = (const char*)memchr(base, '\n', f.size);
-  if (!nl) return;  // header only
-  const char* p = nl + 1;
-  // last newline
-  const char* lastnl = end - 1;
-  while (lastnl >= p && *lastnl != '\n') lastnl--;
-  const char* body_end = (lastnl >= p) ? lastnl + 1 : p;
-  while (p < body_end) {
-    const char* q = p + target;
-    if (q >= body_end) {
-      q = body_end;
-    } else {
-      const char* x = (const char*)memchr(q, '\n', body_end - q);
-      q = x ? x + 1 : body_end;
-    }
-    out.push_back({p, q, kind});
-    p = q;
+  for (size_t p = 0; p < f.size; p += target) out.push_back({f.data, f.size, p, std::min(f.size, p + target), kind});
+}
+// Resolve a chunk to complete lines. Calls body(b, e) on [b, e) where every line ends with '\n'
+// and e is just past one; a final line lacking '\n' is copied (leaked: IDs may point into it).
+template <class B>
+static inline void chunk_lines(const Chunk& c, B&& body) {
+  const char* d = c.base;
+  size_t b;
+  if (c.off == 0 || d[c.off - 1] != '\n') {
+    const char* x = (const char*)memchr(d + c.off, '\n', c.fsize - c.off);
+    if (!x) return;
+    b = (size_t)(x - d) + 1;
+  } else {
+    b = c.off;
   }
-  if (body_end < end) {  // trailing line without newline
-    size_t L = end - body_end;
-    char* buf = (char*)malloc(L + 16);
-    memcpy(buf, body_end, L);
-    buf[L] = '\n';
-    memset(buf + L + 1, 0, 15);
-    g_tails.push_back(buf);
-    out.push_back({buf, buf + L + 1, kind});
+  size_t e;
+  if (c.end >= c.fsize) {
+    e = c.fsize;
+  } else {
+    const char* x = (const char*)memchr(d + c.end - 1, '\n', c.fsize - (c.end - 1));
+    e = x ? (size_t)(x - d) + 1 : c.fsize;
   }
+  if (b >= e) return;
+  if (d[e - 1] == '\n') {
+    body(d + b, d + e);
+    return;
+  }
+  // e == fsize, final line unterminated
+  size_t ln = e;
+  while (ln > b && d[ln - 1] != '\n') ln--;
+  if (ln > b) body(d + b, d + ln);
+  size_t L = e - ln;
+  char* buf = (char*)malloc(L + 16);
+  memcpy(buf, d + ln, L);
+  buf[L] = '\n';
+  memset(buf + L + 1, 0, 15);
+  body(buf, buf + L + 1);
 }
 
 // ---------------------------------------------------------------- small lookup table (read-only)
@@ -682,6 +757,7 @@ struct IdTable {
     mask = c - 1;
     limit = c * 7 / 10;
     w = (std::atomic<u64>*)zalloc(cap * 8);
+    prefault((void*)w, cap * 8);
     ptr = (const char**)zalloc(cap * 8);
     len = (u32*)zalloc(cap * 4);
     count = 0;
@@ -929,10 +1005,25 @@ struct PCol {
   size_t dn = 0, dcap = 0;
   vector<u8> defs;     // bit-packed definition levels (optional only)
   i64 nvals = 0;       // rows
+  bool ext = false;    // data is a borrowed buffer (not from malloc)
+  void use(u8* buf, size_t cap) {
+    data = buf;
+    dcap = cap;
+    dn = 0;
+    ext = true;
+  }
   inline u8* need(size_t k) {
     if (dn + k > dcap) {
-      dcap = std::max(dcap * 2, dn + k + 65536);
-      data = (u8*)realloc(data, dcap);
+      size_t nc = std::max(dcap * 2, dn + k + 65536);
+      if (ext) {
+        u8* q = (u8*)malloc(nc);
+        memcpy(q, data, dn);
+        data = q;
+        ext = false;
+      } else {
+        data = (u8*)realloc(data, nc);
+      }
+      dcap = nc;
     }
     u8* r = data + dn;
     dn += k;
@@ -1099,6 +1190,36 @@ struct UserRow {
   int topcat;  // -1 null
 };
 
+// Growable row array over borrowed memory (a dead arena whose pages are already faulted in);
+// moves to the heap only if it outgrows it.
+struct RowBuf {
+  UserRow* p = nullptr;
+  size_t n = 0, cap = 0;
+  bool heap = false;
+  void use(void* mem, size_t bytes) {
+    p = (UserRow*)mem;
+    cap = bytes / sizeof(UserRow);
+    n = 0;
+  }
+  inline void push_back(const UserRow& r) {
+    if (n == cap) grow();
+    p[n++] = r;
+  }
+  void grow() {
+    size_t nc = std::max<size_t>(cap * 2, 4096);
+    UserRow* q = (UserRow*)malloc(nc * sizeof(UserRow));
+    if (n) memcpy(q, p, n * sizeof(UserRow));
+    if (heap) free(p);
+    p = q;
+    cap = nc;
+    heap = true;
+  }
+  size_t size() const { return n; }
+  bool empty() const { return n == 0; }
+  UserRow* begin() const { return p; }
+  UserRow* end() const { return p + n; }
+};
+
 int main() {
   const char* env;
   string DATA = (env = getenv("DATA_DIR")) ? env : "/data";
@@ -1106,6 +1227,8 @@ int main() {
   int ncpu = (env = getenv("NCPU")) ? atoi(env) : (int)std::thread::hardware_concurrency();
   if (ncpu < 1) ncpu = 1;
   NT = ncpu;
+  g_pool.start(NT);
+  if (getenv("SS_NOPREFAULT")) g_prefault = false;
 
   // ---- manifest
   string man = read_all(DATA + "/manifest.json");
@@ -1126,96 +1249,101 @@ int main() {
   const i64 DAY0 = floordiv(WS, DAYMS);
   const int NDAYS = (int)(floordiv(WE - 1, DAYMS) - DAY0 + 1);
 
-  // ---- products / categories
-  string prod_s = read_all(DATA + "/products.csv");
+  // ---- products / categories and campaigns: parsed on a helper thread while the links run
+  // (only the events+clicks phase and later need them)
+  string prod_s, camp_s;
   vector<string> cats;
-  vector<Str> pkeys;
-  vector<int> pcat;
-  {
-    LookupTable catT;
-    vector<Str> catkeys;
-    const char* p = prod_s.data();
-    const char* e = p + prod_s.size();
-    bool first = true;
-    while (p < e) {
-      const char* nl = (const char*)memchr(p, '\n', e - p);
-      const char* le = nl ? nl : e;
-      if (!first) {
-        Str f[2];
-        if (split<2>(p, le, f) && f[0].n) {
-          string c(f[1].p, f[1].n);
-          int ci = -1;
-          for (size_t i = 0; i < cats.size(); i++)
-            if (cats[i] == c) {
-              ci = (int)i;
-              break;
-            }
-          if (ci < 0) {
-            ci = (int)cats.size();
-            cats.push_back(c);
-          }
-          pkeys.push_back(f[0]);
-          pcat.push_back(ci);
-        }
-      }
-      first = false;
-      if (!nl) break;
-      p = nl + 1;
-    }
-  }
-  int UNKNOWN = -1;
-  for (size_t i = 0; i < cats.size(); i++)
-    if (cats[i] == "unknown") UNKNOWN = (int)i;
-  if (UNKNOWN < 0) {
-    UNKNOWN = (int)cats.size();
-    cats.push_back("unknown");
-  }
-  const int NCAT = (int)cats.size();
-  // Packing limits: event ts is stored relative to window_start in 32 bits, category in 8 bits.
-  if (WE - WS <= 0 || WE - WS >= (1LL << 32) || NCAT > 256) {
-    errno = 0;
-    die("window longer than 49 days or more than 256 categories: unsupported packing");
-  }
-  LookupTable prodT;
-  prodT.build(pkeys);
-  // map table values (product index) -> category index
-  for (auto& v : prodT.v)
-    if (v >= 0) v = pcat[v];
-  vector<int> catrank(NCAT);
-  {
-    vector<int> ord(NCAT);
-    for (int i = 0; i < NCAT; i++) ord[i] = i;
-    std::sort(ord.begin(), ord.end(), [&](int a, int b) { return cats[a] < cats[b]; });
-    for (int i = 0; i < NCAT; i++) catrank[ord[i]] = i;
-  }
-
-  // ---- campaigns
-  string camp_s = read_all(DATA + "/campaigns.csv");
+  int UNKNOWN = -1, NCAT = 0, NCAMP = 0, ORGANIC = 0;
+  LookupTable prodT, campT;
+  vector<int> catrank;
   vector<Str> ckeys;
   vector<string> cchan;
-  {
-    const char* p = camp_s.data();
-    const char* e = p + camp_s.size();
-    bool first = true;
-    while (p < e) {
-      const char* nl = (const char*)memchr(p, '\n', e - p);
-      const char* le = nl ? nl : e;
-      if (!first) {
-        Str f[2];
-        if (split<2>(p, le, f) && f[0].n) {
-          ckeys.push_back(f[0]);
-          cchan.push_back(string(f[1].p, f[1].n));
+  std::thread aux([&] {
+    // ---- products / categories
+    prod_s = read_all(DATA + "/products.csv");
+    vector<Str> pkeys;
+    vector<int> pcat;
+    {
+      LookupTable catT;
+      vector<Str> catkeys;
+      const char* p = prod_s.data();
+      const char* e = p + prod_s.size();
+      bool first = true;
+      while (p < e) {
+        const char* nl = (const char*)memchr(p, '\n', e - p);
+        const char* le = nl ? nl : e;
+        if (!first) {
+          Str f[2];
+          if (split<2>(p, le, f) && f[0].n) {
+            string c(f[1].p, f[1].n);
+            int ci = -1;
+            for (size_t i = 0; i < cats.size(); i++)
+              if (cats[i] == c) {
+                ci = (int)i;
+                break;
+              }
+            if (ci < 0) {
+              ci = (int)cats.size();
+              cats.push_back(c);
+            }
+            pkeys.push_back(f[0]);
+            pcat.push_back(ci);
+          }
         }
+        first = false;
+        if (!nl) break;
+        p = nl + 1;
       }
-      first = false;
-      if (!nl) break;
-      p = nl + 1;
     }
-  }
-  LookupTable campT;
-  campT.build(ckeys);
-  const int NCAMP = (int)ckeys.size();
-  const int ORGANIC = NCAMP;
+    for (size_t i = 0; i < cats.size(); i++)
+      if (cats[i] == "unknown") UNKNOWN = (int)i;
+    if (UNKNOWN < 0) {
+      UNKNOWN = (int)cats.size();
+      cats.push_back("unknown");
+    }
+    NCAT = (int)cats.size();
+    // Packing limits: event ts is stored relative to window_start in 32 bits, category in 8 bits.
+    if (WE - WS <= 0 || WE - WS >= (1LL << 32) || NCAT > 256) {
+      errno = 0;
+      die("window longer than 49 days or more than 256 categories: unsupported packing");
+    }
+    prodT.build(pkeys);
+    // map table values (product index) -> category index
+    for (auto& v : prodT.v)
+      if (v >= 0) v = pcat[v];
+    catrank.assign(NCAT, 0);
+    {
+      vector<int> ord(NCAT);
+      for (int i = 0; i < NCAT; i++) ord[i] = i;
+      std::sort(ord.begin(), ord.end(), [&](int a, int b) { return cats[a] < cats[b]; });
+      for (int i = 0; i < NCAT; i++) catrank[ord[i]] = i;
+    }
+
+    // ---- campaigns
+    camp_s = read_all(DATA + "/campaigns.csv");
+    {
+      const char* p = camp_s.data();
+      const char* e = p + camp_s.size();
+      bool first = true;
+      while (p < e) {
+        const char* nl = (const char*)memchr(p, '\n', e - p);
+        const char* le = nl ? nl : e;
+        if (!first) {
+          Str f[2];
+          if (split<2>(p, le, f) && f[0].n) {
+            ckeys.push_back(f[0]);
+            cchan.push_back(string(f[1].p, f[1].n));
+          }
+        }
+        first = false;
+        if (!nl) break;
+        p = nl + 1;
+      }
+    }
+    campT.build(ckeys);
+    NCAMP = (int)ckeys.size();
+    ORGANIC = NCAMP;
+  });
 
   // ---- files
   vector<string> evf = list_csv(DATA + "/events"), clf = list_csv(DATA + "/clicks"), lkf = list_csv(DATA + "/links");
@@ -1232,7 +1360,8 @@ int main() {
   for (auto& f : evm) make_chunks(f, 1, target, mchunks);
   for (auto& f : clm) make_chunks(f, 2, target, mchunks);
   // biggest chunks first for better balance
-  std::sort(mchunks.begin(), mchunks.end(), [](const Chunk& a, const Chunk& b) { return (a.e - a.b) > (b.e - b.b); });
+  std::stable_sort(mchunks.begin(), mchunks.end(),
+                   [](const Chunk& a, const Chunk& b) { return (a.end - a.off) > (b.end - b.off); });
   logt("setup");
 
   // ---- partitions
@@ -1255,7 +1384,7 @@ int main() {
   typedef BList<SEv, 1300> SList;
   vector<vector<EvList>> evp;
   vector<vector<ClList>> clp;
-  vector<Arena> arenas(NT);
+  vector<Arena> arenas(NT), carenas(NT);  // event records / click records
 
   int PSH = 0;  // person partition = slot >> PSH
   for (int attempt = 0;; attempt++) {
@@ -1286,7 +1415,7 @@ int main() {
         }
         npend = 0;
       };
-      scan_lines2<2>(c.b, c.e, [&](Str* f) {
+      chunk_lines(c, [&](const char* cb, const char* ce) { scan_lines2<2>(cb, ce, [&](Str* f) {
         if (f[0].n && f[1].n) {
           PendL& q = pend[npend++];
           q.ap = f[0].p;
@@ -1299,7 +1428,7 @@ int main() {
           ids.prefetch(q.bh);
           if (npend == PB) flush();
         }
-      });
+      }); });
       flush();
       ids.count.fetch_add(local);
     });
@@ -1311,6 +1440,7 @@ int main() {
     logt("links parsed");
     // ---- union-find
     nameof = (u32*)IdTable::zalloc(cap * 4);
+    prefault(nameof, cap * 4);
     // Lock-free union-find: a root is the only node whose parent is 0, and it changes only by
     // CAS from 0, linking the larger slot under the smaller. Path halving uses CAS too.
     // parent field accessors on the packed words (the tag bits never change after insert)
@@ -1378,12 +1508,14 @@ int main() {
         }
     });
     logt("union-find");
+    if (aux.joinable()) aux.join();
 
     // ---- events + clicks
     evp.assign(NT, vector<EvList>(PE));
     clp.assign(NT, vector<ClList>(PU));
     // virtual reservation: any one thread could end up parsing everything
-    for (auto& a : arenas) a.init(evbytes + clbytes + (64 << 20));
+    for (auto& a : arenas) a.init(evbytes + (64 << 20));
+    for (auto& a : carenas) a.init(clbytes + (64 << 20));
     parallel((int)mchunks.size(), [&](int ci, int t) {
       if (ids.overflow.load(std::memory_order_relaxed)) return;
       const Chunk& c = mchunks[ci];
@@ -1415,7 +1547,7 @@ int main() {
               local);
           npend = 0;
         };
-        scan_lines2<7>(c.b, c.e, [&](Str* f) {
+        chunk_lines(c, [&](const char* cb, const char* ce) { scan_lines2<7>(cb, ce, [&](Str* f) {
           if (!f[0].n) return;
           EvRec r;
           const u64 h = hbytes2(f[0].p, f[0].n, r.h2);
@@ -1467,11 +1599,11 @@ int main() {
             }
           }
           out[part].push(r, ar);
-        });
+        }); });
         flush_ev();
       } else {
         auto& out = clp[t];
-        Arena& ar = arenas[t];
+        Arena& ar = carenas[t];
         struct PendCl {
           ClRec r;
           const char* up;
@@ -1495,7 +1627,7 @@ int main() {
               local);
           npend = 0;
         };
-        scan_lines2<4>(c.b, c.e, [&](Str* f) {
+        chunk_lines(c, [&](const char* cb, const char* ce) { scan_lines2<4>(cb, ce, [&](Str* f) {
           i64 ts;
           if (f[0].n && f[1].n && parse_ts(f[3].p, f[3].n, ts) && ts >= CWS && ts < WE) {
             int camp = campT.find(f[2].p, f[2].n);
@@ -1512,7 +1644,7 @@ int main() {
               if (npend == PB) flush_cl();
             }
           }
-        });
+        }); });
         flush_cl();
       }
       ids.count.fetch_add(local);
@@ -1583,8 +1715,11 @@ int main() {
 
   // ---- sessionize + attribute per person partition
   const size_t CSZ = (size_t)(NCAMP + 1) * NDAYS;
-  vector<vector<i64>> cstat(NT, vector<i64>(CSZ * 4, 0));  // sessions, purchasing, revenue, assisted
-  vector<vector<UserRow>> urows(NT);
+  // sessions, purchasing, revenue, assisted; allocated by each worker on first use (not serially here)
+  vector<vector<i64>> cstat(NT);
+  // Event-record arenas are dead after dedup: their (already faulted) pages hold the output rows.
+  vector<RowBuf> urows(NT);
+  for (int t = 0; t < NT; t++) urows[t].use(arenas[t].base, arenas[t].cap);
   {
     struct TL {
       vector<u32> off, fill;
@@ -1637,6 +1772,7 @@ int main() {
           if (off[l + 1] != off[l]) cl[fill[l]++] = c;
         });
 
+      if (cstat[t].empty()) cstat[t].assign(CSZ * 4, 0);
       i64* cs = cstat[t].data();
       auto& rows = urows[t];
       auto& cnt = tl.cnt;
@@ -1783,28 +1919,72 @@ int main() {
     cols[5] = PCol{"top_category", P_BYTE_ARRAY, true, 1};
     return cols;
   };
-  parallel(NT + 1, [&](int i, int) {
-    if (i < NT) {
-      auto& rows = urows[i];
-      if (rows.empty() && i != 0) return;
-      vector<PCol> cols = make_ucols();
-      for (auto& r : rows) {
-        cols[0].put_str(r.name, r.nlen);
-        cols[1].put_i32(r.day);
-        cols[2].put_i64(r.sessions);
-        cols[3].put_i64(r.events);
-        cols[4].put_i64(r.revenue);
-        if (r.topcat >= 0)
-          cols[5].put_str(cats[r.topcat].data(), (u32)cats[r.topcat].size());
+  // Build the columns (reads names from the CSV mappings), then write the files while the
+  // CSV mappings are zapped in parallel, so process exit has almost no page tables to tear down.
+  // user_daily: each thread's rows are cut into pieces (one file each) for load balance.
+  struct UPiece {
+    int t;
+    size_t b, e;
+  };
+  vector<UPiece> up;
+  {
+    size_t nrows = 0;
+    for (auto& r : urows) nrows += r.size();
+    const size_t PIECE = std::max<size_t>(16384, nrows / ((size_t)NT * 4) + 1);
+    for (int t = 0; t < NT; t++)
+      for (size_t b = 0; b < urows[t].size(); b += PIECE) up.push_back({t, b, std::min(urows[t].size(), b + PIECE)});
+    if (up.empty()) up.push_back({0, 0, 0});
+  }
+  const int NUP = (int)up.size();
+  vector<vector<PCol>> ucols(NUP);
+  std::unique_ptr<std::atomic<size_t>[]> carve(new std::atomic<size_t>[NT]);
+  for (int t = 0; t < NT; t++) carve[t] = 0;
+  vector<PCol> ccols;
+  i64 cn = 0;
+  parallel(NUP + 1, [&](int i, int) {
+    if (i < NUP) {
+      const UPiece& pc = up[i];
+      const UserRow* rb = urows[pc.t].begin() + pc.b;
+      const UserRow* re = urows[pc.t].begin() + pc.e;
+      vector<PCol>& cols = ucols[i] = make_ucols();
+      // column buffers carved from a dead session arena (pages already faulted in)
+      const size_t n = pc.e - pc.b;
+      size_t s0 = 0, s5 = 0;
+      for (const UserRow* r = rb; r < re; r++) {
+        s0 += 4 + r->nlen;
+        if (r->topcat >= 0) s5 += 4 + cats[r->topcat].size();
+      }
+      const size_t sz[6] = {s0, 4 * n, 8 * n, 8 * n, 8 * n, s5};
+      size_t tot = 0;
+      for (size_t x : sz) tot += (x + 64) & ~(size_t)63;
+      const size_t at = carve[pc.t].fetch_add(tot);
+      if (at + tot <= sarenas[pc.t].cap) {
+        u8* m = (u8*)sarenas[pc.t].base + at;
+        for (int k = 0; k < 6; k++) {
+          cols[k].use(m, sz[k]);
+          m += (sz[k] + 64) & ~(size_t)63;
+        }
+      }
+      cols[5].defs.reserve(n / 8 + 1);
+      for (const UserRow* r = rb; r < re; r++) {
+        if (r + 16 < re) __builtin_prefetch(r[16].name);  // names are scattered over the CSV mappings
+        cols[0].put_str(r->name, r->nlen);
+        cols[1].put_i32(r->day);
+        cols[2].put_i64(r->sessions);
+        cols[3].put_i64(r->events);
+        cols[4].put_i64(r->revenue);
+        if (r->topcat >= 0)
+          cols[5].put_str(cats[r->topcat].data(), (u32)cats[r->topcat].size());
         else
           cols[5].put_null();
       }
-      write_parquet(ud + "/part-" + std::to_string(i) + ".parquet", cols, (i64)rows.size());
     } else {
       vector<i64> tot(CSZ * 4, 0);
       for (int t = 0; t < NT; t++)
-        for (size_t k = 0; k < CSZ * 4; k++) tot[k] += cstat[t][k];
-      vector<PCol> cols(7);
+        if (!cstat[t].empty())
+          for (size_t k = 0; k < CSZ * 4; k++) tot[k] += cstat[t][k];
+      vector<PCol>& cols = ccols;
+      cols.resize(7);
       cols[0] = PCol{"campaign_id", P_BYTE_ARRAY, false, 1};
       cols[1] = PCol{"channel", P_BYTE_ARRAY, false, 1};
       cols[2] = PCol{"day", P_INT32, false, 2};
@@ -1831,7 +2011,25 @@ int main() {
           cols[6].put_i64(cpi == ORGANIC ? 0 : r[3]);
           n++;
         }
-      write_parquet(cd + "/part-0.parquet", cols, n);
+      cn = n;
+    }
+  });
+  struct Piece {
+    const char* p;
+    size_t n;
+  };
+  vector<Piece> zap;
+  for (auto* v : {&evm, &clm, &lkm})
+    for (auto& f : *v)
+      for (size_t o = 0; o < f.size; o += (4 << 20)) zap.push_back({f.data + o, std::min<size_t>(4 << 20, f.size - o)});
+  parallel(NUP + 1 + (int)zap.size(), [&](int i, int) {
+    if (i < NUP) {
+      write_parquet(ud + "/part-" + std::to_string(i) + ".parquet", ucols[i], (i64)(up[i].e - up[i].b));
+    } else if (i == NUP) {
+      write_parquet(cd + "/part-0.parquet", ccols, cn);
+    } else {
+      const Piece& z = zap[i - NUP - 1];
+      madvise((void*)z.p, z.n, MADV_DONTNEED);
     }
   });
   logt("written");
