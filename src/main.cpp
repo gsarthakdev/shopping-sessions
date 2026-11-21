@@ -1778,9 +1778,13 @@ int main() {
   const size_t CSZ = (size_t)(NCAMP + 1) * NDAYS;
   // sessions, purchasing, revenue, assisted; allocated by each worker on first use (not serially here)
   vector<vector<i64>> cstat(NT);
-  // Event-record arenas are dead after dedup: their (already faulted) pages hold the output rows.
+  // Dedup wrote its survivors into the event-record blocks, so output rows take the unused rest
+  // of the (lightly used) survivor arenas.
   vector<RowBuf> urows(NT);
-  for (int t = 0; t < NT; t++) urows[t].use(arenas[t].base, arenas[t].cap);
+  for (int t = 0; t < NT; t++) {
+    const size_t u = (sarenas[t].used + 63) & ~(size_t)63;
+    urows[t].use(sarenas[t].base + u, u < sarenas[t].cap ? sarenas[t].cap - u : 0);
+  }
   {
     struct TL {
       vector<u32> off, fill;
@@ -2008,7 +2012,7 @@ int main() {
       const UserRow* rb = urows[pc.t].begin() + pc.b;
       const UserRow* re = urows[pc.t].begin() + pc.e;
       vector<PCol>& cols = ucols[i] = make_ucols();
-      // column buffers carved from a dead session arena (pages already faulted in)
+      // column buffers carved from a dead event-record arena (pages already faulted in)
       const size_t n = pc.e - pc.b;
       size_t s0 = 0, s5 = 0;
       for (const UserRow* r = rb; r < re; r++) {
@@ -2019,8 +2023,8 @@ int main() {
       size_t tot = 0;
       for (size_t x : sz) tot += (x + 64) & ~(size_t)63;
       const size_t at = carve[pc.t].fetch_add(tot);
-      if (at + tot <= sarenas[pc.t].cap) {
-        u8* m = (u8*)sarenas[pc.t].base + at;
+      if (at + tot <= arenas[pc.t].cap) {  // event-record arenas are dead once sessions are done
+        u8* m = (u8*)arenas[pc.t].base + at;
         for (int k = 0; k < 6; k++) {
           cols[k].use(m, sz[k]);
           m += (sz[k] + 64) & ~(size_t)63;
