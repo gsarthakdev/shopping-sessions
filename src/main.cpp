@@ -765,9 +765,17 @@ struct IdTable {
 // ---------------------------------------------------------------- arenas + block lists
 // Per-thread bump allocator over a large reserved mapping (huge-page advised), so record
 // storage is touched densely and sequentially. Falls back to malloc if it runs out.
+// Blocks of a list that has been consumed can be recycled: allocations of up to RECYCLE_MIN bytes
+// take them first, which skips faulting in (and zeroing) fresh pages.
+static constexpr size_t RECYCLE_MIN = 15616;
 struct Arena {
   char* base = nullptr;
   size_t used = 0, cap = 0;
+  void* fl = nullptr;  // free list of recycled blocks (each >= RECYCLE_MIN bytes), linked through word 0
+  inline void recycle(void* b) {
+    *(void**)b = fl;
+    fl = b;
+  }
   void init(size_t bytes) {
     cap = (bytes + 4095) & ~(size_t)4095;
     void* m = mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -779,6 +787,11 @@ struct Arena {
     used = 0;
   }
   inline void* alloc(size_t n) {
+    if (fl && n <= RECYCLE_MIN) {
+      void* r = fl;
+      fl = *(void**)r;
+      return r;
+    }
     n = (n + 63) & ~(size_t)63;
     if (used + n > cap) return malloc(n);
     void* r = base + used;
@@ -811,6 +824,17 @@ struct BList {
     total++;
   }
   size_t size() const { return total; }
+  // hand every block to the arena's free list; the list must not be used afterwards
+  void recycle_into(Arena& a) {
+    static_assert(sizeof(Block) >= RECYCLE_MIN, "block too small to recycle");
+    for (Block* b = head; b;) {
+      Block* nx = b->next;
+      a.recycle(b);
+      b = nx;
+    }
+    head = tail = nullptr;
+    total = 0;
+  }
   template <class F>
   inline void each(F&& f) const {
     for (const Block* b = head; b; b = b->next)
@@ -1288,7 +1312,7 @@ int main() {
   IdTable ids;
   u32* nameof = nullptr;  // name slot + 1 for linked roots, 0 = self
   typedef BList<EvRec, 450> EvList;
-  typedef BList<ClRec, 500> ClList;
+  typedef BList<ClRec, 480> ClList;
   typedef BList<ClU, 400> CUList;
   typedef BList<SEv, 1300> SList;
   typedef BList<UEv, 650> UList;
@@ -1304,7 +1328,21 @@ int main() {
     PSH = __builtin_ctzll(cap) - 8;
     logt("ids init");
     // ---- links
-    vector<vector<std::pair<u32, u32>>> lpairs(NT);
+    // a link between two distinct IDs, with each ID's first 8 bytes (big-endian, zero-padded): when
+    // those differ they order the IDs byte-wise, so names rarely need the ID text itself
+    struct LPair {
+      u32 a, b;
+      u64 pa, pb;
+    };
+    auto idpre = [](const char* p, u32 n) {
+      u64 v = 0;
+      if (n >= 8)
+        v = load8(p);
+      else
+        for (u32 i = 0; i < n; i++) v |= (u64)(u8)p[i] << (8 * i);
+      return __builtin_bswap64(v);
+    };
+    vector<vector<LPair>> lpairs(NT);
     parallel((int)lchunks.size(), [&](int ci, int t) {
       if (ids.overflow.load(std::memory_order_relaxed)) return;
       const Chunk& c = lchunks[ci];
@@ -1315,6 +1353,7 @@ int main() {
         u32 an, bn;
         u64 ah, bh;
       };
+      static_assert(sizeof(u64) == 8 && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "idpre assumes little-endian");
       constexpr int PB = 16;
       PendL pend[PB];
       int npend = 0;
@@ -1323,7 +1362,7 @@ int main() {
           PendL& q = pend[i];
           u32 a = ids.intern_h(q.ap, q.an, q.ah, local);
           u32 b = ids.intern_h(q.bp, q.bn, q.bh, local);
-          if (a != b) out.push_back({a, b});
+          if (a != b) out.push_back({a, b, idpre(q.ap, q.an), idpre(q.bp, q.bn)});
         }
         npend = 0;
       };
@@ -1381,7 +1420,6 @@ int main() {
       std::atomic<u64>* w;
       ParRef operator[](u32 x) const { return ParRef{w[x]}; }
     } ap{ids.w};
-    auto* an = reinterpret_cast<std::atomic<u32>*>(nameof);
     auto afind = [&](u32 x) {
       for (;;) {
         u32 p = ap[x].load(std::memory_order_acquire);
@@ -1393,7 +1431,7 @@ int main() {
     };
     parallel(NT, [&](int i, int) {
       for (auto& pr : lpairs[i]) {
-        u32 a = pr.first, b = pr.second;
+        u32 a = pr.a, b = pr.b;
         for (;;) {
           a = afind(a);
           b = afind(b);
@@ -1404,20 +1442,56 @@ int main() {
         }
       }
     });
-    // names (byte-wise smallest ID per linked person) and flattening, now that no union is pending
+    // flatten, now that no union is pending, and send (root, ID, prefix) to the root's table slice
+    struct NTup {
+      u32 r, s;
+      u64 pre;
+    };
+    vector<vector<vector<NTup>>> ntup(NT, vector<vector<NTup>>(PU));
     parallel(NT, [&](int i, int) {
-      for (auto& pr : lpairs[i])
-        for (u32 s : {pr.first, pr.second}) {
-          u32 r = afind(s);
-          if (r != s) ap[s].store(r + 1, std::memory_order_relaxed);
-          u32 cur = an[r].load(std::memory_order_relaxed);
-          for (;;) {
-            u32 cs = cur ? cur - 1 : r;
-            if (cs == s || strcmpb(ids.ptr[s], ids.len_of(s), ids.ptr[cs], ids.len_of(cs)) >= 0) break;
-            if (an[r].compare_exchange_weak(cur, s + 1, std::memory_order_relaxed)) break;
-          }
-        }
+      auto& o = ntup[i];
+      auto one = [&](u32 s, u64 pre) {
+        const u32 r = afind(s);
+        if (r != s && ap[s].load(std::memory_order_relaxed) != r + 1) ap[s].store(r + 1, std::memory_order_relaxed);
+        o[r >> PSH].push_back(NTup{r, s, pre});
+      };
+      for (auto& pr : lpairs[i]) {
+        one(pr.a, pr.pa);
+        one(pr.b, pr.pb);
+      }
     });
+    // names: the byte-wise smallest ID per linked person, one slice of roots per task
+    {
+      const u32 PSZ = 1u << PSH, PM = PSZ - 1, NONE = 0xFFFFFFFFu;
+      vector<vector<u64>> nbp(NT);
+      vector<vector<u32>> nbs(NT), ntouch(NT);
+      parallel(PU, [&](int q, int t) {
+        auto& bp = nbp[t];
+        auto& bs = nbs[t];
+        auto& touch = ntouch[t];
+        if (bs.empty()) bp.resize(PSZ), bs.assign(PSZ, NONE);
+        for (int k = 0; k < NT; k++)
+          for (const NTup& x : ntup[k][q]) {
+            const u32 L = x.r & PM;
+            const u32 b = bs[L];
+            if (b == NONE) {
+              bs[L] = x.s;
+              bp[L] = x.pre;
+              touch.push_back(L);
+            } else if (x.s != b && (x.pre < bp[L] || (x.pre == bp[L] && strcmpb(ids.ptr[x.s], ids.len_of(x.s), ids.ptr[b],
+                                                                                   ids.len_of(b)) < 0))) {
+              bs[L] = x.s;
+              bp[L] = x.pre;
+            }
+          }
+        for (u32 L : touch) {
+          const u32 r = ((u32)q << PSH) | L;
+          nameof[r] = bs[L] == r ? 0 : bs[L] + 1;
+          bs[L] = NONE;
+        }
+        touch.clear();
+      });
+    }
     logt("union-find");
 
     // ---- events + clicks (user IDs are hashed here and resolved after dedup)
@@ -1425,8 +1499,6 @@ int main() {
     clu.assign(NT, vector<CUList>(PU));
     const u64 imask = ids.mask;
     // virtual reservation: any one thread could end up parsing everything
-    // (events and clicks in separate arenas: the event records are dead after dedup and their
-    // already-faulted pages are reused for the resolved records)
     for (auto& a : arenas) a.init(evbytes + (64 << 20));
     for (auto& a : carenas) a.init(clbytes + (64 << 20));
     parallel((int)mchunks.size(), [&](int ci, int t) {
@@ -1538,6 +1610,7 @@ int main() {
         Arena& ar = sarenas[t];
         for (const EvRec* q : tab)
           if (q && q->pc) out[(q->uh & imask) >> PSH].push(UEv{q->ts_rel, q->pc, q->uh, q->ur}, ar);
+        for (int k = 0; k < NT; k++) evp[k][p].recycle_into(ar);
       });
     }
     logt("dedup");
@@ -1545,7 +1618,6 @@ int main() {
     // ---- resolve user IDs, one table slice per task (each ID's records all sit in its own slice's
     // partition, so only this task ever inserts it); scatter by person partition
     evp.clear();
-    for (auto& a : arenas) a.used = 0;
     sp.assign(NT, vector<SList>(PU));
     clp.assign(NT, vector<ClList>(PU));
     parallel(PU, [&](int q, int t) {
@@ -1568,7 +1640,7 @@ int main() {
         return ids.person_of(ids.intern_h(uref_p(ur), uref_n(ur), hh, local));
       };
       auto& sout = sp[t];
-      Arena& ar = arenas[t];
+      Arena& ar = sarenas[t];
       for (int k = 0; k < NT; k++)
         su[k][q].each([&](const UEv& e) {
           const u32 person = resolve(e.uh, e.ur);
@@ -1580,6 +1652,7 @@ int main() {
           const u32 person = resolve(c.uh, c.ur);
           cout_[person >> PSH].push(ClRec{c.ts, person, c.camp, c.cid, c.cidn}, ar);
         });
+      for (int k = 0; k < NT; k++) su[k][q].recycle_into(ar), clu[k][q].recycle_into(ar);
       ids.count.fetch_add(local);
       if (ids.count.load(std::memory_order_relaxed) > ids.limit) ids.overflow.store(true);
     });
