@@ -704,6 +704,28 @@ struct IdTable {
   }
   // local: per-thread pending insert counter
   inline u32 intern(const char* p, u32 n, u32& local) { return intern_h(p, n, hbytes(p, n), local); }
+  // Batched lookup: issue all home-slot loads first (independent, so they overlap), then resolve.
+  // A hit in the home slot needs nothing else; anything else takes the full path.
+  template <int B, class GetH, class GetS, class Done>
+  inline void intern_batch(int n, GetH&& geth, GetS&& gets, Done&& done, u32& local) {
+    u64 cur[B];
+    for (int i = 0; i < n; i++) cur[i] = w[geth(i) & mask].load(std::memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+      const u64 hh = geth(i);
+      u32 slot;
+      if ((cur[i] & ~PMASK) == tag_of(hh)) {
+        slot = (u32)(hh & mask);
+        u32 pp = (u32)(cur[i] & PMASK);
+        done(i, pp ? pp - 1 : slot);
+      } else {
+        const char* p;
+        u32 len_;
+        gets(i, p, len_);
+        slot = intern_h(p, len_, hh, local);
+        done(i, person_of(slot));
+      }
+    }
+  }
   inline u32 intern_h(const char* p, u32 n, u64 hh, u32& local) {
     const u64 tag = tag_of(hh);
     u64 idx = hh & mask;
@@ -1380,12 +1402,17 @@ int main() {
         PendEv pend[PB];
         int npend = 0;
         auto flush_ev = [&]() {
-          for (int i = 0; i < npend; i++) {
-            PendEv& pe = pend[i];
-            u32 s = ids.intern_h(pe.up, pe.un, pe.uh, local);
-            pe.r.person = ids.person_of(s);  // same cache line as the lookup
-            out[pe.part].push(pe.r, ar);
-          }
+          ids.intern_batch<PB>(
+              npend, [&](int i) { return pend[i].uh; },
+              [&](int i, const char*& p, u32& n) {
+                p = pend[i].up;
+                n = pend[i].un;
+              },
+              [&](int i, u32 person) {
+                pend[i].r.person = person;
+                out[pend[i].part].push(pend[i].r, ar);
+              },
+              local);
           npend = 0;
         };
         scan_lines2<7>(c.b, c.e, [&](Str* f) {
@@ -1455,12 +1482,17 @@ int main() {
         PendCl pend[PB];
         int npend = 0;
         auto flush_cl = [&]() {
-          for (int i = 0; i < npend; i++) {
-            PendCl& pc = pend[i];
-            u32 s = ids.intern_h(pc.up, pc.un, pc.uh, local);
-            pc.r.person = ids.person_of(s);
-            out[pc.r.person >> PSH].push(pc.r, ar);
-          }
+          ids.intern_batch<PB>(
+              npend, [&](int i) { return pend[i].uh; },
+              [&](int i, const char*& p, u32& n) {
+                p = pend[i].up;
+                n = pend[i].un;
+              },
+              [&](int i, u32 person) {
+                pend[i].r.person = person;
+                out[person >> PSH].push(pend[i].r, ar);
+              },
+              local);
           npend = 0;
         };
         scan_lines2<4>(c.b, c.e, [&](Str* f) {
