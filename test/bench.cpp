@@ -1,0 +1,173 @@
+// Single-threaded per-line cost breakdown of the event parse path.
+// usage: bench FILE.csv
+#define main real_main
+#include "../src/main.cpp"
+#undef main
+
+static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+int main(int argc, char** argv) {
+  File f = map_file(argv[1]);
+  const char* b = (const char*)memchr(f.data, '\n', f.size) + 1;
+  const char* e = f.data + f.size;
+  while (e[-1] != '\n') e--;
+  // warm the page cache mapping
+  volatile u64 sink = 0;
+  for (const char* p = b; p < e; p += 4096) sink = sink + *p;
+  size_t lines = 0;
+  scan_lines<7>(b, e, [&](Str*) { lines++; });
+  printf("%zu lines, %.1f MB\n", lines, (e - b) / 1e6);
+  auto run = [&](const char* name, auto&& body) {
+    double t = now();
+    u64 acc = 0;
+    for (const char* p = b; p < e;) {
+      const char* q = p + (256 << 10);
+      if (q >= e) q = e; else q = (const char*)memchr(q, '\n', e - q) + 1;
+      scan_lines2<7>(p, q, [&](Str* fl) { acc += body(fl); });
+      p = q;
+    }
+    t = now() - t;
+    printf("%-28s %6.1f ns/line  (%llu)\n", name, t * 1e9 / lines, (unsigned long long)acc);
+  };
+  run("tokenize", [&](Str* fl) -> u64 { return fl[0].n + fl[6].n; });
+  {
+    double t = now();
+    u64 acc = 0;
+    for (const char* p = b; p < e;) {
+      const char* q = p + (256 << 10);
+      if (q >= e) q = e; else q = (const char*)memchr(q, '\n', e - q) + 1;
+      scan_lines2<7>(p, q, [&](Str* fl) { acc += fl[0].n + fl[6].n; });
+      p = q;
+    }
+    t = now() - t;
+    printf("%-28s %6.1f ns/line  (%llu)\n", "tokenize2 (256K chunks)", t * 1e9 / lines, (unsigned long long)acc);
+  }
+  run("+ ts parse", [&](Str* fl) -> u64 {
+    i64 a = 0, c = 0;
+    parse_ts(fl[2].p, fl[2].n, a);
+    parse_ts(fl[3].p, fl[3].n, c);
+    return (u64)(a + c);
+  });
+  run("+ eid hash2", [&](Str* fl) -> u64 {
+    i64 a = 0, c = 0;
+    parse_ts(fl[2].p, fl[2].n, a);
+    parse_ts(fl[3].p, fl[3].n, c);
+    u32 h2;
+    return (u64)(a + c) + hbytes2(fl[0].p, fl[0].n, h2) + h2;
+  });
+  run("+ uid hash", [&](Str* fl) -> u64 {
+    i64 a = 0, c = 0;
+    parse_ts(fl[2].p, fl[2].n, a);
+    parse_ts(fl[3].p, fl[3].n, c);
+    u32 h2;
+    return (u64)(a + c) + hbytes2(fl[0].p, fl[0].n, h2) + h2 + hbytes(fl[1].p, fl[1].n);
+  });
+  // full validation, then + intern, then + push
+  string dir = string(argv[1]).substr(0, string(argv[1]).rfind("/events/"));
+  string prod_s = read_all(dir + "/products.csv");
+  vector<Str> pkeys;
+  {
+    const char* p = prod_s.data();
+    const char* pe = p + prod_s.size();
+    p = (const char*)memchr(p, '\n', pe - p) + 1;
+    scan_lines<2>(p, pe, [&](Str* fl) { pkeys.push_back(fl[0]); });
+  }
+  LookupTable prodT;
+  prodT.build(pkeys);
+  const i64 WS = 0, WE = INT64_MAX / 2;
+  auto validate = [&](Str* f, EvRec& r, const char*& up, u32& un) -> bool {
+    u64 h = hbytes2(f[0].p, f[0].n, r.h2);
+    r.hlo = (u32)h;
+    i64 ings = 0;
+    parse_ingest_s(f[3].p, f[3].n, ings);
+    r.ing = (u32)ings;
+    i64 ing = ings * 1000;
+    r.pc = 0;
+    i64 ts;
+    if (f[1].n && f[5].n && parse_ts(f[2].p, f[2].n, ts) && ts >= WS && ts < WE && ing - ts <= DAYMS) {
+      u32 pc = 0;
+      const char* tp = f[4].p;
+      if (f[4].n == 4) {
+        if (memcmp(tp, "view", 4) == 0 || memcmp(tp, "cart", 4) == 0) pc = 1;
+      } else if (f[4].n == 8 && memcmp(tp, "purchase", 8) == 0) {
+        int ci2 = prodT.find(f[5].p, f[5].n);
+        pc = (1000u << 8) | (u32)(ci2 >= 0 ? ci2 : 0);
+      }
+      r.pc = pc;
+      r.ts_rel = (u32)ts;
+      up = f[1].p;
+      un = f[1].n;
+      return pc != 0;
+    }
+    return false;
+  };
+  run("full validate", [&](Str* fl) -> u64 {
+    EvRec r;
+    const char* up;
+    u32 un;
+    bool ok = validate(fl, r, up, un);
+    return r.hlo + ok;
+  });
+  IdTable ids;
+  ids.init(1 << 22);
+  u32 local = 0;
+  run("+ intern (no prefetch)", [&](Str* fl) -> u64 {
+    EvRec r;
+    const char* up;
+    u32 un;
+    if (validate(fl, r, up, un)) r.person = ids.intern(up, un, local);
+    return r.hlo + r.person;
+  });
+  run("+ intern again (warm)", [&](Str* fl) -> u64 {
+    EvRec r;
+    const char* up;
+    u32 un;
+    if (validate(fl, r, up, un)) r.person = ids.intern(up, un, local);
+    return r.hlo + r.person;
+  });
+  for (int PB : {8, 16, 32, 64}) {
+    struct Pend {
+      EvRec r;
+      const char* up;
+      u32 un;
+      u64 uh;
+    };
+    vector<Pend> pend(PB);
+    int np = 0;
+    u64 acc2 = 0;
+    auto flush = [&]() {
+      for (int i = 0; i < np; i++) { u32 sl = ids.intern_h(pend[i].up, pend[i].un, pend[i].uh, local); acc2 += ids.person_of(sl); }
+      np = 0;
+    };
+    char nm[64];
+    snprintf(nm, sizeof nm, "+ intern prefetch PB=%d", PB);
+    run(nm, [&](Str* fl) -> u64 {
+      EvRec r;
+      const char* up;
+      u32 un;
+      if (validate(fl, r, up, un)) {
+        Pend& p = pend[np++];
+        p.r = r;
+        p.up = up;
+        p.un = un;
+        p.uh = hbytes(up, un);
+        ids.prefetch(p.uh);
+        if (np == PB) flush();
+      }
+      return r.hlo;
+    });
+    flush();
+  }
+  vector<BList<EvRec, 500>> parts(256);
+  Arena ar;
+  ar.init(lines * 40 + (64 << 20));
+  run("+ push 256 parts", [&](Str* fl) -> u64 {
+    EvRec r;
+    const char* up;
+    u32 un;
+    if (validate(fl, r, up, un)) r.person = ids.intern(up, un, local);
+    parts[r.h2 >> 24].push(r, ar);
+    return r.hlo;
+  });
+  return 0;
+}

@@ -2,3 +2,4 @@ build/
 out/
 dev/
 *.parquet
+.DS_Store

@@ -41,6 +41,15 @@ int main() {
     }
     i64 a = 0, b = 0;
     bool ra = parse_ts(buf, n, a), rb = parse_ts_slow(buf, n, b);
+    {
+      i64 sec = 0;
+      bool ri = parse_ingest_s(buf, n, sec);
+      i64 want = rb ? (b >= 0 ? b / 1000 : -((-b + 999) / 1000)) : 0;
+      if (ri != rb || (ri && sec != want)) {
+        fprintf(stderr, "INGEST MISMATCH '%.*s'\n", n, buf);
+        return 1;
+      }
+    }
     checked++;
     if (ra != rb || (ra && a != b)) {
       fprintf(stderr, "MISMATCH '%.*s' fast=%d/%lld slow=%d/%lld\n", n, buf, ra, (long long)a, rb, (long long)b);
