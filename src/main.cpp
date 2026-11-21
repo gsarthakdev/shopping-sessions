@@ -66,8 +66,29 @@ static inline u64 fmix(u64 h) {
   h ^= h >> 33;
   return h;
 }
+// The last n < 8 bytes of a string [s, p + n) as a little-endian word (== memcpy into a zeroed
+// u64), without a variable-length memcpy call. A string of 8+ bytes is read with one load ending
+// at its last byte; a short one is read with an 8-byte load from p, which may run past the string
+// but never past p's 4 KB page (memory protection is per page), else memcpy.
+static inline u64 tail_word(const char* s, const char* p, u32 n) {
+  if (p - s + n >= 8) {
+    u64 v;
+    memcpy(&v, p + n - 8, 8);
+    return (v >> 1) >> (63 - 8 * n);  // == v >> (64 - 8n), and 0 for n == 0
+  }
+  if (n == 0) return 0;
+  if (((uintptr_t)p & 4095) <= 4096 - 8) {
+    u64 v;
+    memcpy(&v, p, 8);
+    return v & ((1ULL << (8 * n)) - 1);
+  }
+  u64 v = 0;
+  memcpy(&v, p, n);
+  return v;
+}
 static inline u64 hbytes(const char* p, u32 n) {
   u64 h = 0x9E3779B97F4A7C15ULL ^ ((u64)n * 0x100000001b3ULL);
+  const char* s = p;
   while (n >= 8) {
     u64 v;
     memcpy(&v, p, 8);
@@ -76,15 +97,31 @@ static inline u64 hbytes(const char* p, u32 n) {
     p += 8;
     n -= 8;
   }
-  u64 v = 0;
-  memcpy(&v, p, n);
+  u64 v = tail_word(s, p, n);
   h = (h ^ v) * 0x94d049bb133111ebULL;
   h = fmix(h);
   return h ? h : 1;
 }
-static inline bool streq(const char* a, u32 an, const char* b, u32 bn) {
-  return an == bn && memcmp(a, b, an) == 0;
+// memcmp(a, b, n) == 0 without a library call for short strings: two overlapping loads for 8..16
+// bytes, one masked load for < 8 when it stays within both pointers' pages (see tail_word).
+static inline bool bytes_eq(const char* a, const char* b, u32 n) {
+  if (n - 8 <= 8) {
+    u64 a0, b0, a1, b1;
+    memcpy(&a0, a, 8);
+    memcpy(&b0, b, 8);
+    memcpy(&a1, a + n - 8, 8);
+    memcpy(&b1, b + n - 8, 8);
+    return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+  }
+  if (n < 8 && ((uintptr_t)a & 4095) <= 4096 - 8 && ((uintptr_t)b & 4095) <= 4096 - 8) {
+    u64 x, y;
+    memcpy(&x, a, 8);
+    memcpy(&y, b, 8);
+    return ((x ^ y) & ((1ULL << (8 * n)) - 1)) == 0;
+  }
+  return memcmp(a, b, n) == 0;
 }
+static inline bool streq(const char* a, u32 an, const char* b, u32 bn) { return an == bn && bytes_eq(a, b, an); }
 // byte-wise lexicographic
 static inline int strcmpb(const char* a, u32 an, const char* b, u32 bn) {
   int c = memcmp(a, b, an < bn ? an : bn);
@@ -292,13 +329,23 @@ static inline void scan_lines2(const char* b, const char* e, F&& on) {
       }
     }
     ns += cnt;
-    while (nl) {
-      int i = __builtin_ctzll(nl);
+    // newlines: 0..2 per block in practice; write two unconditionally (no loop-exit mispredicts)
+    const int ncnt = __builtin_popcountll(nl);
+    for (int k = 0; k < 2; k++) {
+      const int i = __builtin_ctzll(nl | (1ULL << 63));
       nl &= nl - 1;
-      nls[nn] = base + (u32)i;
-      qc[nn] = qcum + (u32)__builtin_popcountll(qt & ((1ULL << i) - 1));
-      nn++;
+      nls[nn + k] = base + (u32)i;
+      qc[nn + k] = qcum + (u32)__builtin_popcountll(qt & ((1ULL << i) - 1));
     }
+    if (__builtin_expect(ncnt > 2, 0)) {
+      for (int k = 2; k < ncnt; k++) {
+        const int i = __builtin_ctzll(nl);
+        nl &= nl - 1;
+        nls[nn + k] = base + (u32)i;
+        qc[nn + k] = qcum + (u32)__builtin_popcountll(qt & ((1ULL << i) - 1));
+      }
+    }
+    nn += ncnt;
     qcum += (u32)__builtin_popcountll(qt);
   }
   size_t si = 0;
@@ -314,7 +361,9 @@ static inline void scan_lines2(const char* b, const char* e, F&& on) {
         const u32 s1 = seps[si + j];
         const char* s = b + s0;
         const u32 L = s1 - s0;
-        const u32 c = (u32)(L >= 2) & (u32)(s[0] == '"') & (u32)(s[L - (L != 0)] == '"');
+        // quoted: '"' first and last, L >= 2. For L == 0, s[0] is the separator itself; b[s1 - 1]
+        // may then be b[-1] (the byte before the chunk is always readable, see make_chunks).
+        const u32 c = (u32)(L != 1) & (u32)(s[0] == '"') & (u32)(b[(i64)s1 - 1] == '"');
         f[j].p = s + c;
         f[j].n = L - 2 * c;
         q2 += 2 * c;
@@ -600,13 +649,15 @@ static void make_chunks(const File& f, int kind, size_t target, vector<Chunk>& o
     p = q;
   }
   if (body_end < end) {  // trailing line without newline
+    // padded on both sides: the tokenizer may read the byte before a chunk
     size_t L = end - body_end;
-    char* buf = (char*)malloc(L + 16);
-    memcpy(buf, body_end, L);
-    buf[L] = '\n';
-    memset(buf + L + 1, 0, 15);
+    char* buf = (char*)malloc(L + 32);
+    memset(buf, '\n', 16);
+    memcpy(buf + 16, body_end, L);
+    buf[16 + L] = '\n';
+    memset(buf + 16 + L + 1, 0, 15);
     g_tails.push_back(buf);
-    out.push_back({buf, buf + L + 1, kind});
+    out.push_back({buf + 16, buf + 16 + L + 1, kind});
   }
 }
 
@@ -825,6 +876,7 @@ struct SEv {  // 12 bytes
 static inline u64 hbytes2(const char* p, u32 n, u32& h2) {
   u64 h = 0x9E3779B97F4A7C15ULL ^ ((u64)n * 0x100000001b3ULL);
   u64 g = 0xC2B2AE3D27D4EB4FULL + n;
+  const char* s = p;
   while (n >= 8) {
     u64 v = load8(p);
     h = (h ^ v) * 0xbf58476d1ce4e5b9ULL;
@@ -834,8 +886,7 @@ static inline u64 hbytes2(const char* p, u32 n, u32& h2) {
     p += 8;
     n -= 8;
   }
-  u64 v = 0;
-  memcpy(&v, p, n);
+  u64 v = tail_word(s, p, n);
   h = (h ^ v) * 0x94d049bb133111ebULL;
   g = (g + v) * 0x9FB21C651E98DF25ULL;
   h2 = (u32)(fmix(g) >> 32);
