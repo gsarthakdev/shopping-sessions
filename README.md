@@ -11,19 +11,23 @@ Shopping Sessions track, statically linked into a `FROM scratch` image (~1.3 MB)
    A line is well-formed when it has the exact field count and its quote count equals 2 × the number of fields
    that start and end with a quote.
 3. **Linked IDs.** Link lines are interned into a lock-free hash table (CAS on 64-bit hashes). A lock-free
-   union-find joins them, and each person is named by the byte-wise smallest of their IDs.
+   union-find joins them. Each person is named by the byte-wise smallest of their IDs, found one slice of roots at a
+   time by comparing 8-byte ID prefixes (the full text only on a prefix tie).
 4. **Events and clicks.** Timestamps are parsed with SWAR fast paths (F1/F2 via a month table, F3 via 8-digit
-   SWAR), with exact validation. User IDs are hashed, the table slot is prefetched, and lookups are resolved in
-   batches of 16. Events are scattered into 32-byte records by event_id hash; valid clicks go into 32-byte records
-   by person hash. Both use per-thread bump arenas with linked 16 KB blocks.
+   SWAR), with exact validation. User IDs are only hashed here. Events go into 36-byte records (with the user_id
+   hash and a pointer to its text) by event_id hash; valid clicks go by user_id hash. Both use per-thread bump
+   arenas with linked 16 KB blocks.
 5. **Dedup.** For each event_id partition, the copy with the smallest `ingest_ts` wins. The kept copy's validity
-   (computed while parsing, late rule included) decides whether it survives. Survivors become 12-byte records,
-   scattered by person.
-6. **Sessions.** For each person partition: a counting sort groups records by person, then each person's records
+   (computed while parsing, late rule included) decides whether it survives. Survivors are scattered by user_id
+   hash, which also picks the ID-table slice their ID lives in.
+6. **ID resolution.** Each task takes one ID-table slice (128 KB at full size, so it stays in cache) and looks up
+   or inserts the IDs of that slice's events and clicks, scattering 12-byte event records and click records by
+   person. Consumed blocks are recycled for the output, so this pass touches almost no fresh memory.
+7. **Sessions.** For each person partition: a counting sort groups records by person, then each person's records
    are sorted by timestamp and split into sessions on gaps over 30 minutes. A sliding 7-day click window gives the
    credited click (latest `ts`, then the smallest `click_id`) and the set of assisting campaigns, kept as
    per-campaign counts plus an active list.
-7. **Output.** A minimal hand-written Parquet writer (PLAIN, uncompressed, `day` as INT32 `DATE`) writes one
+8. **Output.** A minimal hand-written Parquet writer (PLAIN, uncompressed, `day` as INT32 `DATE`) writes one
    `user_daily` file per thread and one `campaign_daily` file.
 
 ## Testing
