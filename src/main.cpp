@@ -646,6 +646,7 @@ struct Chunk {
 
 static void make_chunks(const File& f, int kind, size_t target, vector<Chunk>& out) {
   if (!f.size) return;
+  if ((uintptr_t)(f.data + f.size) >> 48) die("address above 48 bits");  // IDs are packed as 48-bit pointers
   for (size_t p = 0; p < f.size; p += target) out.push_back({f.data, f.size, p, std::min(f.size, p + target), kind});
 }
 // Resolve a chunk to complete lines. Calls body(b, e) on [b, e) where every line ends with '\n'
@@ -682,6 +683,7 @@ static inline void chunk_lines(const Chunk& c, B&& body) {
   memcpy(buf, d + ln, L);
   buf[L] = '\n';
   memset(buf + L + 1, 0, 15);
+  if ((uintptr_t)(buf + L + 1) >> 48) die("address above 48 bits");
   body(buf, buf + L + 1);
 }
 
@@ -773,35 +775,22 @@ struct IdTable {
     return t ? t : (1ULL << PBITS);
   }
   inline void prefetch(u64 hh) const { __builtin_prefetch((const void*)&w[hh & mask], 1, 1); }
-  inline u32 len_of(u32 s) const { return len[s]; }
+  // LEN_UNK (an ID over 65534 bytes, interned from an event/click): the value ends at the first ',' or '"'
+  // (no value holds either, and user_id is never a line's last field).
+  static constexpr u32 LEN_UNK = 0xFFFFFFFFu;
+  inline u32 len_of(u32 s) const {
+    u32 n = len[s];
+    if (n != LEN_UNK) return n;
+    const char* p = ptr[s];
+    const char* q = p;
+    while (*q != ',' && *q != '"') q++;
+    return (u32)(q - p);
+  }
   inline u32 person_of(u32 s) const {
     u32 p = (u32)(w[s].load(std::memory_order_relaxed) & PMASK);
     return p ? p - 1 : s;
   }
   // local: per-thread pending insert counter
-  inline u32 intern(const char* p, u32 n, u32& local) { return intern_h(p, n, hbytes(p, n), local); }
-  // Batched lookup: issue all home-slot loads first (independent, so they overlap), then resolve.
-  // A hit in the home slot needs nothing else; anything else takes the full path.
-  template <int B, class GetH, class GetS, class Done>
-  inline void intern_batch(int n, GetH&& geth, GetS&& gets, Done&& done, u32& local) {
-    u64 cur[B];
-    for (int i = 0; i < n; i++) cur[i] = w[geth(i) & mask].load(std::memory_order_relaxed);
-    for (int i = 0; i < n; i++) {
-      const u64 hh = geth(i);
-      u32 slot;
-      if ((cur[i] & ~PMASK) == tag_of(hh)) {
-        slot = (u32)(hh & mask);
-        u32 pp = (u32)(cur[i] & PMASK);
-        done(i, pp ? pp - 1 : slot);
-      } else {
-        const char* p;
-        u32 len_;
-        gets(i, p, len_);
-        slot = intern_h(p, len_, hh, local);
-        done(i, person_of(slot));
-      }
-    }
-  }
   inline u32 intern_h(const char* p, u32 n, u64 hh, u32& local) {
     const u64 tag = tag_of(hh);
     u64 idx = hh & mask;
@@ -829,9 +818,17 @@ struct IdTable {
 // ---------------------------------------------------------------- arenas + block lists
 // Per-thread bump allocator over a large reserved mapping (huge-page advised), so record
 // storage is touched densely and sequentially. Falls back to malloc if it runs out.
+// Blocks of a list that has been consumed can be recycled: allocations of up to RECYCLE_MIN bytes
+// take them first, which skips faulting in (and zeroing) fresh pages.
+static constexpr size_t RECYCLE_MIN = 15616;
 struct Arena {
   char* base = nullptr;
   size_t used = 0, cap = 0;
+  void* fl = nullptr;  // free list of recycled blocks (each >= RECYCLE_MIN bytes), linked through word 0
+  inline void recycle(void* b) {
+    *(void**)b = fl;
+    fl = b;
+  }
   void init(size_t bytes) {
     cap = (bytes + 4095) & ~(size_t)4095;
     void* m = mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -847,6 +844,11 @@ struct Arena {
     used = 0;
   }
   inline void* alloc(size_t n) {
+    if (fl && n <= RECYCLE_MIN) {
+      void* r = fl;
+      fl = *(void**)r;
+      return r;
+    }
     n = (n + 63) & ~(size_t)63;
     if (used + n > cap) return malloc(n);
     void* r = base + used;
@@ -883,6 +885,17 @@ struct BList {
     total++;
   }
   size_t size() const { return total; }
+  // hand every block to the arena's free list; the list must not be used afterwards
+  void recycle_into(Arena& a) {
+    static_assert(sizeof(Block) >= RECYCLE_MIN, "block too small to recycle");
+    for (Block* b = head; b;) {
+      Block* nx = b->next;
+      a.recycle(b);
+      b = nx;
+    }
+    head = tail = nullptr;
+    total = 0;
+  }
   template <class F>
   inline void each(F&& f) const {
     for (const Block* b = head; b; b = b->next)
@@ -897,13 +910,30 @@ struct BList {
 
 // ---------------------------------------------------------------- records
 // pc: 0 = invalid event, 1 = valid view/cart, (price << 8 | category) for a valid purchase (price >= 1)
-struct EvRec {  // 24 bytes; event_id identity = partition bits + hlo + h2
+// User IDs are not resolved while parsing: records carry the ID's hash and a pointer to its text,
+// and are resolved after dedup, one ID-table slice (hash partition) at a time, so lookups hit cache.
+// Text pointer and length in one word: user-space addresses fit in 48 bits (checked in make_chunks);
+// a length that does not fit in 16 bits is stored as 0xFFFF and found by scanning when needed.
+static inline u64 uref(const char* p, u32 n) { return (u64)(uintptr_t)p | ((u64)(n < 0xFFFF ? n : 0xFFFF) << 48); }
+static inline const char* uref_p(u64 r) { return (const char*)(uintptr_t)(r & ((1ULL << 48) - 1)); }
+static inline u32 uref_n(u64 r) {
+  u32 n = (u32)(r >> 48);
+  return n == 0xFFFF ? 0xFFFFFFFFu : n;
+}
+struct __attribute__((packed, aligned(4))) EvRec {  // 36 bytes; event_id identity = partition bits + hlo + h2
   u32 hlo;      // low 32 bits of the event_id hash
   u32 h2;       // independent second event_id hash
   u32 ing;      // ingest_ts in whole seconds since the epoch (F1); UINT32_MAX if unusable
   u32 ts_rel;   // ts - window_start (valid only)
-  u32 person;
   u32 pc;
+  u64 uh;  // user_id hash (valid only)
+  u64 ur;  // user_id text: pointer | length << 48 (valid only); see uref()
+};
+struct __attribute__((packed, aligned(4))) UEv {  // 24 bytes: a surviving event, before ID resolution
+  u32 ts_rel;
+  u32 pc;
+  u64 uh;
+  u64 ur;
 };
 struct SEv {  // 12 bytes
   u32 ts_rel;
@@ -936,6 +966,14 @@ struct ClRec {
   u32 person;
   u32 camp;
   const char* cid;
+  u32 cidn;
+};
+struct ClU {  // a valid click, before ID resolution
+  i64 ts;
+  u64 uh;
+  u64 ur;
+  const char* cid;
+  u32 camp;
   u32 cidn;
 };
 
@@ -1392,14 +1430,16 @@ int main() {
 
   IdTable ids;
   u32* nameof = nullptr;  // name slot + 1 for linked roots, 0 = self
-  typedef BList<EvRec, 500> EvList;
-  typedef BList<ClRec, 500> ClList;
-  typedef BList<SEv, 1000> SList;
-  // dedup writes survivors into the event blocks it has finished reading
-  static_assert(sizeof(SList::Block) <= sizeof(EvList::Block), "SList block must fit in an EvList block");
+  typedef BList<EvRec, 450> EvList;
+  typedef BList<ClRec, 480> ClList;
+  typedef BList<ClU, 400> CUList;
+  typedef BList<SEv, 1300> SList;
+  typedef BList<UEv, 650> UList;
   vector<vector<EvList>> evp;
   vector<vector<ClList>> clp;
-  vector<Arena> arenas(NT), carenas(NT);  // event records / click records
+  vector<vector<CUList>> clu;
+  vector<vector<SList>> sp;
+  vector<Arena> arenas(NT), carenas(NT), sarenas(NT);
 
   int PSH = 0;  // person partition = slot >> PSH
   for (int attempt = 0;; attempt++) {
@@ -1407,7 +1447,21 @@ int main() {
     PSH = __builtin_ctzll(cap) - 8;
     logt("ids init");
     // ---- links
-    vector<vector<std::pair<u32, u32>>> lpairs(NT);
+    // a link between two distinct IDs, with each ID's first 8 bytes (big-endian, zero-padded): when
+    // those differ they order the IDs byte-wise, so names rarely need the ID text itself
+    struct LPair {
+      u32 a, b;
+      u64 pa, pb;
+    };
+    auto idpre = [](const char* p, u32 n) {
+      u64 v = 0;
+      if (n >= 8)
+        v = load8(p);
+      else
+        for (u32 i = 0; i < n; i++) v |= (u64)(u8)p[i] << (8 * i);
+      return __builtin_bswap64(v);
+    };
+    vector<vector<LPair>> lpairs(NT);
     parallel((int)lchunks.size(), [&](int ci, int t) {
       if (ids.overflow.load(std::memory_order_relaxed)) return;
       const Chunk& c = lchunks[ci];
@@ -1418,6 +1472,7 @@ int main() {
         u32 an, bn;
         u64 ah, bh;
       };
+      static_assert(sizeof(u64) == 8 && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "idpre assumes little-endian");
       constexpr int PB = 16;
       PendL pend[PB];
       int npend = 0;
@@ -1426,7 +1481,7 @@ int main() {
           PendL& q = pend[i];
           u32 a = ids.intern_h(q.ap, q.an, q.ah, local);
           u32 b = ids.intern_h(q.bp, q.bn, q.bh, local);
-          if (a != b) out.push_back({a, b});
+          if (a != b) out.push_back({a, b, idpre(q.ap, q.an), idpre(q.bp, q.bn)});
         }
         npend = 0;
       };
@@ -1485,7 +1540,6 @@ int main() {
       std::atomic<u64>* w;
       ParRef operator[](u32 x) const { return ParRef{w[x]}; }
     } ap{ids.w};
-    auto* an = reinterpret_cast<std::atomic<u32>*>(nameof);
     auto afind = [&](u32 x) {
       for (;;) {
         u32 p = ap[x].load(std::memory_order_acquire);
@@ -1497,7 +1551,7 @@ int main() {
     };
     parallel(NT, [&](int i, int) {
       for (auto& pr : lpairs[i]) {
-        u32 a = pr.first, b = pr.second;
+        u32 a = pr.a, b = pr.b;
         for (;;) {
           a = afind(a);
           b = afind(b);
@@ -1508,64 +1562,77 @@ int main() {
         }
       }
     });
-    // names (byte-wise smallest ID per linked person) and flattening, now that no union is pending
+    // flatten, now that no union is pending, and send (root, ID, prefix) to the root's table slice
+    struct NTup {
+      u32 r, s;
+      u64 pre;
+    };
+    vector<vector<vector<NTup>>> ntup(NT, vector<vector<NTup>>(PU));
     parallel(NT, [&](int i, int) {
-      for (auto& pr : lpairs[i])
-        for (u32 s : {pr.first, pr.second}) {
-          u32 r = afind(s);
-          if (r != s) ap[s].store(r + 1, std::memory_order_relaxed);
-          u32 cur = an[r].load(std::memory_order_relaxed);
-          for (;;) {
-            u32 cs = cur ? cur - 1 : r;
-            if (cs == s || strcmpb(ids.ptr[s], ids.len_of(s), ids.ptr[cs], ids.len_of(cs)) >= 0) break;
-            if (an[r].compare_exchange_weak(cur, s + 1, std::memory_order_relaxed)) break;
-          }
-        }
+      auto& o = ntup[i];
+      auto one = [&](u32 s, u64 pre) {
+        const u32 r = afind(s);
+        if (r != s && ap[s].load(std::memory_order_relaxed) != r + 1) ap[s].store(r + 1, std::memory_order_relaxed);
+        o[r >> PSH].push_back(NTup{r, s, pre});
+      };
+      for (auto& pr : lpairs[i]) {
+        one(pr.a, pr.pa);
+        one(pr.b, pr.pb);
+      }
     });
+    // names: the byte-wise smallest ID per linked person, one slice of roots per task
+    {
+      const u32 PSZ = 1u << PSH, PM = PSZ - 1, NONE = 0xFFFFFFFFu;
+      vector<vector<u64>> nbp(NT);
+      vector<vector<u32>> nbs(NT), ntouch(NT);
+      parallel(PU, [&](int q, int t) {
+        auto& bp = nbp[t];
+        auto& bs = nbs[t];
+        auto& touch = ntouch[t];
+        if (bs.empty()) bp.resize(PSZ), bs.assign(PSZ, NONE);
+        for (int k = 0; k < NT; k++)
+          for (const NTup& x : ntup[k][q]) {
+            const u32 L = x.r & PM;
+            const u32 b = bs[L];
+            if (b == NONE) {
+              bs[L] = x.s;
+              bp[L] = x.pre;
+              touch.push_back(L);
+            } else if (x.s != b && (x.pre < bp[L] || (x.pre == bp[L] && strcmpb(ids.ptr[x.s], ids.len_of(x.s), ids.ptr[b],
+                                                                                   ids.len_of(b)) < 0))) {
+              bs[L] = x.s;
+              bp[L] = x.pre;
+            }
+          }
+        for (u32 L : touch) {
+          const u32 r = ((u32)q << PSH) | L;
+          nameof[r] = bs[L] == r ? 0 : bs[L] + 1;
+          bs[L] = NONE;
+        }
+        touch.clear();
+      });
+    }
     logt("union-find");
     if (aux.joinable()) aux.join();
 
-    // ---- events + clicks
+    // ---- events + clicks (user IDs are hashed here and resolved after dedup)
     evp.assign(NT, vector<EvList>(PE));
-    clp.assign(NT, vector<ClList>(PU));
+    clu.assign(NT, vector<CUList>(PU));
+    const u64 imask = ids.mask;
     // virtual reservation: any one thread could end up parsing everything
     for (auto& a : arenas) a.init(evbytes + (64 << 20));
     for (auto& a : carenas) a.init(clbytes + (64 << 20));
     parallel((int)mchunks.size(), [&](int ci, int t) {
-      if (ids.overflow.load(std::memory_order_relaxed)) return;
       const Chunk& c = mchunks[ci];
-      u32 local = 0;
       if (c.kind == 1) {
-        auto& out = evp[t];
         Arena& ar = arenas[t];
-        struct PendEv {
-          EvRec r;
-          const char* up;
-          u32 un;
-          u32 part;
-          u64 uh;
-        };
-        constexpr int PB = 16;
-        PendEv pend[PB];
-        int npend = 0;
-        auto flush_ev = [&]() {
-          ids.intern_batch<PB>(
-              npend, [&](int i) { return pend[i].uh; },
-              [&](int i, const char*& p, u32& n) {
-                p = pend[i].up;
-                n = pend[i].un;
-              },
-              [&](int i, u32 person) {
-                pend[i].r.person = person;
-                out[pend[i].part].push(pend[i].r, ar);
-              },
-              local);
-          npend = 0;
-        };
+        auto& out = evp[t];
         chunk_lines(c, [&](const char* cb, const char* ce) { scan_lines2<7>(cb, ce, [&](Str* f) {
           if (!f[0].n) return;
           EvRec r;
-          const u64 h = hbytes2(f[0].p, f[0].n, r.h2);
+          u32 h2;
+          const u64 h = hbytes2(f[0].p, f[0].n, h2);
+          r.h2 = h2;
           r.hlo = (u32)h;
           const u32 part = (u32)(h >> (64 - PE_BITS));
           i64 ings;
@@ -1573,8 +1640,9 @@ int main() {
           r.ing = ingok ? (u32)ings : UINT32_MAX;
           const i64 ing = ings * 1000;
           r.pc = 0;
-          r.person = 0;
           r.ts_rel = 0;
+          r.uh = 0;
+          r.ur = 0;
           i64 ts;
           if (ingok && f[1].n && f[5].n && parse_ts(f[2].p, f[2].n, ts) && ts >= WS && ts < WE && ing - ts <= DAYMS) {
             u32 pc = 0;
@@ -1601,68 +1669,113 @@ int main() {
             if (pc) {
               r.pc = pc;
               r.ts_rel = (u32)(ts - WS);
-              // defer the ID lookup: hash now, prefetch the slot, resolve in a batch
-              PendEv& pe = pend[npend++];
-              pe.r = r;
-              pe.part = part;
-              pe.up = f[1].p;
-              pe.un = f[1].n;
-              pe.uh = hbytes(f[1].p, f[1].n);
-              ids.prefetch(pe.uh);
-              if (npend == PB) flush_ev();
-              return;
+              r.uh = hbytes(f[1].p, f[1].n);
+              r.ur = uref(f[1].p, f[1].n);
             }
           }
           out[part].push(r, ar);
         }); });
-        flush_ev();
       } else {
-        auto& out = clp[t];
         Arena& ar = carenas[t];
-        struct PendCl {
-          ClRec r;
-          const char* up;
-          u32 un;
-          u64 uh;
-        };
-        constexpr int PB = 16;
-        PendCl pend[PB];
-        int npend = 0;
-        auto flush_cl = [&]() {
-          ids.intern_batch<PB>(
-              npend, [&](int i) { return pend[i].uh; },
-              [&](int i, const char*& p, u32& n) {
-                p = pend[i].up;
-                n = pend[i].un;
-              },
-              [&](int i, u32 person) {
-                pend[i].r.person = person;
-                out[person >> PSH].push(pend[i].r, ar);
-              },
-              local);
-          npend = 0;
-        };
+        auto& out = clu[t];
         chunk_lines(c, [&](const char* cb, const char* ce) { scan_lines2<4>(cb, ce, [&](Str* f) {
           i64 ts;
           if (f[0].n && f[1].n && parse_ts(f[3].p, f[3].n, ts) && ts >= CWS && ts < WE) {
             int camp = campT.find(f[2].p, f[2].n);
             if (camp >= 0) {
-              PendCl& pc = pend[npend++];
-              pc.r.ts = ts;
-              pc.r.camp = (u32)camp;
-              pc.r.cid = f[0].p;
-              pc.r.cidn = f[0].n;
-              pc.up = f[1].p;
-              pc.un = f[1].n;
-              pc.uh = hbytes(f[1].p, f[1].n);
-              ids.prefetch(pc.uh);
-              if (npend == PB) flush_cl();
+              ClU r;
+              r.ts = ts;
+              r.uh = hbytes(f[1].p, f[1].n);
+              r.ur = uref(f[1].p, f[1].n);
+              r.cid = f[0].p;
+              r.cidn = f[0].n;
+              r.camp = (u32)camp;
+              out[(r.uh & imask) >> PSH].push(r, ar);
             }
           }
         }); });
-        flush_cl();
       }
+    });
+    logt("events+clicks parsed");
+
+    // ---- dedup events per eid partition, scatter survivors by user-ID hash partition (= ID-table slice)
+    vector<vector<UList>> su(NT, vector<UList>(PU));
+    for (auto& a : sarenas) a.init(evbytes / 2 + (16 << 20));
+    {
+      vector<vector<const EvRec*>> tabs(NT);
+      parallel(PE, [&](int p, int t) {
+        size_t n = 0;
+        for (int k = 0; k < NT; k++) n += evp[k][p].size();
+        size_t sz = 16;
+        while (sz < n * 2) sz <<= 1;
+        auto& tab = tabs[t];
+        tab.assign(sz, nullptr);
+        u64 m = sz - 1;
+        for (int k = 0; k < NT; k++)
+          evp[k][p].each([&](const EvRec& r) {
+            u64 idx = r.hlo & m;
+            for (;;) {
+              const EvRec* q = tab[idx];
+              if (!q) {
+                tab[idx] = &r;
+                break;
+              }
+              if (q->hlo == r.hlo && q->h2 == r.h2) {
+                if (r.ing < q->ing) tab[idx] = &r;
+                break;
+              }
+              idx = (idx + 1) & m;
+            }
+          });
+        auto& out = su[t];
+        Arena& ar = sarenas[t];
+        for (const EvRec* q : tab)
+          if (q && q->pc) out[(q->uh & imask) >> PSH].push(UEv{q->ts_rel, q->pc, q->uh, q->ur}, ar);
+        for (int k = 0; k < NT; k++) evp[k][p].recycle_into(ar);
+      });
+    }
+    logt("dedup");
+
+    // ---- resolve user IDs, one table slice per task (each ID's records all sit in its own slice's
+    // partition, so only this task ever inserts it); scatter by person partition
+    evp.clear();
+    sp.assign(NT, vector<SList>(PU));
+    clp.assign(NT, vector<ClList>(PU));
+    parallel(PU, [&](int q, int t) {
+      u32 local = 0;
+      bool bail = ids.overflow.load(std::memory_order_relaxed);
+      {  // pull this task's table slice into cache with one sequential sweep (random first touches cost more)
+        const u64* ws = (const u64*)(const void*)&ids.w[(u64)q << PSH];
+        u64 acc = 0;
+        for (u64 i = 0; i < (1ULL << PSH); i += 8) acc += ws[i];
+        asm volatile("" ::"r"(acc));
+      }
+      auto resolve = [&](u64 hh, u64 ur) -> u32 {
+        const u64 cur = ids.w[hh & imask].load(std::memory_order_relaxed);
+        if ((cur & ~PMASK) == IdTable::tag_of(hh)) {
+          const u32 pp = (u32)(cur & PMASK);
+          return pp ? pp - 1 : (u32)(hh & imask);
+        }
+        // past the load limit (the table still has >= 30% free slots): stop inserting, retry bigger
+        if (bail || (bail = ids.overflow.load(std::memory_order_relaxed))) return 0;
+        return ids.person_of(ids.intern_h(uref_p(ur), uref_n(ur), hh, local));
+      };
+      auto& sout = sp[t];
+      Arena& ar = sarenas[t];
+      for (int k = 0; k < NT; k++)
+        su[k][q].each([&](const UEv& e) {
+          const u32 person = resolve(e.uh, e.ur);
+          sout[person >> PSH].push(SEv{e.ts_rel, e.pc, person}, ar);
+        });
+      auto& cout_ = clp[t];
+      for (int k = 0; k < NT; k++)
+        clu[k][q].each([&](const ClU& c) {
+          const u32 person = resolve(c.uh, c.ur);
+          cout_[person >> PSH].push(ClRec{c.ts, person, c.camp, c.cid, c.cidn}, ar);
+        });
+      for (int k = 0; k < NT; k++) su[k][q].recycle_into(ar), clu[k][q].recycle_into(ar);
       ids.count.fetch_add(local);
+      if (ids.count.load(std::memory_order_relaxed) > ids.limit) ids.overflow.store(true);
     });
     if (ids.overflow) {
       ids.release();
@@ -1671,92 +1784,8 @@ int main() {
     }
     break;
   }
-  logt("events+clicks parsed");
+  logt("resolve");
   fprintf(stderr, "ids=%llu cap=%llu\n", (unsigned long long)ids.count.load(), (unsigned long long)cap);
-
-  // ---- dedup events per eid partition, scatter survivors by person partition
-  vector<vector<SList>> sp(NT, vector<SList>(PU));
-  vector<Arena> sarenas(NT);
-  for (auto& a : sarenas) a.init(evbytes / 4 + (16 << 20));
-  {
-    // Table slot: record pointer << 16 | 16 tag bits from h2, so a probe only dereferences a
-    // record on a likely copy. A losing copy is marked in place (pc = 0), and survivors are then
-    // emitted by a sequential pass over the records instead of a random walk through the table.
-    vector<vector<u64>> tabs(NT);
-    vector<vector<void*>> freeblk(NT);
-    parallel(PE, [&](int p, int t) {
-      size_t n = 0;
-      for (int k = 0; k < NT; k++) n += evp[k][p].size();
-      size_t sz = 16;
-      while (sz < n * 2) sz <<= 1;
-      auto& tab = tabs[t];
-      tab.assign(sz, 0);
-      const u64 m = sz - 1;
-      u64* tb = tab.data();
-      constexpr u32 PF = 16;  // table-slot prefetch distance
-      for (int k = 0; k < NT; k++)
-        for (EvList::Block* b = evp[k][p].head; b; b = b->next) {
-          EvRec* it = b->items;
-          const u32 bn = b->n;
-          for (u32 i = 0; i < bn && i < PF; i++) __builtin_prefetch(&tb[it[i].hlo & m]);
-          for (u32 i = 0; i < bn; i++) {
-            if (i + PF < bn) __builtin_prefetch(&tb[it[i + PF].hlo & m]);
-            EvRec& r = it[i];
-            const u64 tag = r.h2 & 0xFFFF;
-            u64 idx = r.hlo & m;
-            for (;;) {
-              const u64 e = tb[idx];
-              if (!e) {
-                tb[idx] = ((u64)(uintptr_t)&r << 16) | tag;
-                break;
-              }
-              if ((e & 0xFFFF) == tag) {
-                EvRec* q = (EvRec*)(uintptr_t)(e >> 16);
-                if (q->hlo == r.hlo && q->h2 == r.h2) {
-                  if (r.ing < q->ing) {  // equal ingest: identical copies, keep the first
-                    q->pc = 0;
-                    tb[idx] = ((u64)(uintptr_t)&r << 16) | tag;
-                  } else {
-                    r.pc = 0;
-                  }
-                  break;
-                }
-              }
-              idx = (idx + 1) & m;
-            }
-          }
-        }
-      // Survivors go into the event blocks already read (a block holds as many bytes of SEv as
-      // of EvRec, and survivors are half the size), so this pass barely touches fresh memory.
-      auto& out = sp[t];
-      Arena& ar = sarenas[t];
-      vector<void*>& fr = freeblk[t];
-      auto alloc = [&]() -> void* {
-        if (!fr.empty()) {
-          void* x = fr.back();
-          fr.pop_back();
-          return x;
-        }
-        return ar.alloc(sizeof(EvList::Block));
-      };
-      for (int k = 0; k < NT; k++) {
-        EvList::Block* b = evp[k][p].head;
-        while (b) {
-          EvList::Block* nx = b->next;
-          const EvRec* it = b->items;
-          const u32 bn = b->n;
-          for (u32 i = 0; i < bn; i++) {
-            const EvRec& q = it[i];
-            if (q.pc) out[q.person >> PSH].push_with(SEv{q.ts_rel, q.pc, q.person}, alloc);
-          }
-          fr.push_back(b);
-          b = nx;
-        }
-        evp[k][p].head = evp[k][p].tail = nullptr;
-      }
-    });
-  }
-  logt("dedup");
   // person partitions, largest first (whales and the shared-device mega-person dominate the tail)
   vector<int> porder(PU);
   {
