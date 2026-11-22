@@ -1901,14 +1901,26 @@ int main() {
     urows[t].use(sarenas[t].base + u, u < sarenas[t].cap ? sarenas[t].cap - u : 0);
   }
   {
+    // Each partition's events are put in (person, ts) order by one LSD radix sort of 64-bit keys
+    //   key = L << (31 + PB) | ts_rel << PB | payload
+    // (L = person slot within the partition, payload 0 = view/cart, else 1 + index of the
+    // purchase's price/category word). The person pass is a counting scatter whose histogram is
+    // the per-person offset table. A partition that does not fit the layout (window over 2^31 ms,
+    // or too many purchases for PB bits) takes the general path: scatter by person, then sort.
+    const int PB = 64 - 31 - PSH;
+    const bool radix_ok = (u64)(WE - WS) <= (1ULL << 31) && PB >= 8 && !getenv("SS_TEST_NORADIX");
+    const bool clk_general = (u64)(WE - CWS) >= (1ULL << 44) || getenv("SS_TEST_CLKSORT");  // tests: force fallbacks
     struct TL {
       vector<u32> off, fill;
-      vector<u64> ev;     // ts_rel << 32 | pc, grouped by person
-      vector<ClRec> cl;   // grouped by person
+      vector<u64> ev, ev2;  // radix keys (or ts_rel << 32 | pc on the general path)
+      vector<u32> pcv;      // purchase price/category words (radix path)
+      vector<ClRec> cl;     // grouped by person
+      vector<u64> ck;       // one person's clicks: (ts - CWS) << 20 | index
       vector<u32> coff;
       vector<int> cnt, pos, active;
       vector<i64> catsum;
       vector<int> cattouched;
+      vector<u32> h0, h1, h2;
     };
     vector<TL> tls(NT);
     for (auto& tl : tls) {
@@ -1919,21 +1931,84 @@ int main() {
     parallel(PU, [&](int qi, int t) {
       const int q = porder[qi];
       TL& tl = tls[t];
-      size_t ne = 0, ncl = 0;
-      for (int k = 0; k < NT; k++) ne += sp[k][q].size(), ncl += clp[k][q].size();
+      size_t ne = 0;
+      for (int k = 0; k < NT; k++) ne += sp[k][q].size();
       if (!ne) return;
       // Persons in partition q are exactly the slots [q << PSH, (q + 1) << PSH): index directly.
       const u32 PSZ = 1u << PSH, PM = PSZ - 1;
       auto& off = tl.off;
-      off.assign(PSZ + 1, 0);
-      for (int k = 0; k < NT; k++) sp[k][q].each([&](const SEv& e) { off[(e.person & PM) + 1]++; });
-      for (u32 l = 0; l < PSZ; l++) off[l + 1] += off[l];
       auto& fill = tl.fill;
-      fill.assign(off.begin(), off.end() - 1);
       auto& ev = tl.ev;
+      auto& pcv = tl.pcv;
+      off.assign(PSZ + 1, 0);
       ev.resize(ne);
-      for (int k = 0; k < NT; k++)
-        sp[k][q].each([&](const SEv& e) { ev[fill[e.person & PM]++] = ((u64)e.ts_rel << 32) | e.pc; });
+      bool radix = radix_ok;
+      if (radix) {
+        auto& h0 = tl.h0;
+        auto& h1 = tl.h1;
+        auto& h2 = tl.h2;
+        h0.assign(2048, 0);
+        h1.assign(2048, 0);
+        h2.assign(512, 0);
+        pcv.clear();
+        const u64 pmax = (1ULL << PB) - 1;
+        u64* a = ev.data();
+        size_t i = 0;
+        u32* o1 = off.data() + 1;
+        for (int k = 0; k < NT; k++)
+          sp[k][q].each([&](const SEv& e) {
+            const u32 L = e.person & PM;
+            u64 pay = 0;
+            if (e.pc != 1) {
+              pcv.push_back(e.pc);
+              pay = pcv.size();
+            }
+            const u32 ts = e.ts_rel;
+            a[i++] = ((u64)L << (31 + PB)) | ((u64)ts << PB) | pay;
+            h0[ts & 2047]++;
+            h1[(ts >> 11) & 2047]++;
+            h2[ts >> 22]++;
+            o1[L]++;
+          });
+        if (pcv.size() > pmax) {
+          radix = false;
+          off.assign(PSZ + 1, 0);
+        } else {
+          for (u32 l = 0; l < PSZ; l++) off[l + 1] += off[l];
+          auto& ev2 = tl.ev2;
+          ev2.resize(ne);
+          u64* b = ev2.data();
+          auto pass = [&](u64* src, u64* dst, vector<u32>& h, int sh, u64 mask) {
+            u32 sum = 0;
+            for (auto& c : h) {
+              const u32 x = c;
+              c = sum;
+              sum += x;
+            }
+            u32* hp = h.data();
+            for (size_t j = 0; j < ne; j++) {
+              const u64 v = src[j];
+              dst[hp[(v >> sh) & mask]++] = v;
+            }
+          };
+          pass(a, b, h0, PB, 2047);
+          pass(b, a, h1, PB + 11, 2047);
+          pass(a, b, h2, PB + 22, 511);  // ts < 2^31: 9 bits left
+          fill.assign(off.begin(), off.end() - 1);
+          u32* fp = fill.data();
+          for (size_t j = 0; j < ne; j++) {
+            const u64 v = b[j];
+            a[fp[v >> (31 + PB)]++] = v;
+          }
+        }
+      }
+      if (!radix) {
+        for (int k = 0; k < NT; k++) sp[k][q].each([&](const SEv& e) { off[(e.person & PM) + 1]++; });
+        for (u32 l = 0; l < PSZ; l++) off[l + 1] += off[l];
+        fill.assign(off.begin(), off.end() - 1);
+        for (int k = 0; k < NT; k++)
+          sp[k][q].each([&](const SEv& e) { ev[fill[e.person & PM]++] = ((u64)e.ts_rel << 32) | e.pc; });
+      }
       // clicks of people without events are irrelevant
       auto& coff = tl.coff;
       coff.assign(PSZ + 1, 0);
@@ -1960,31 +2035,43 @@ int main() {
       auto& active = tl.active;
       auto& catsum = tl.catsum;
       auto& ctouch = tl.cattouched;
-      auto clk_less = [](const ClRec& a, const ClRec& b) {
-        if (a.ts != b.ts) return a.ts < b.ts;
-        return strcmpb(a.cid, a.cidn, b.cid, b.cidn) < 0;
-      };
-      for (u32 L = 0; L < PSZ; L++) {
-        if (off[L + 1] == off[L]) continue;
+      auto& ck = tl.ck;
+      const u64 tsmask = (1ULL << 31) - 1;
+      const u32* pcp = pcv.data();
+      // one person's sorted events [e0, e1) in either layout
+      auto person = [&](u32 L, const u64* e0, const u64* e1, auto ts_of, auto pc_of) {
         const u32 P = ((u32)q << PSH) | L;
-        u64* e0 = ev.data() + off[L];
-        u64* e1 = ev.data() + off[L + 1];
-        if (e1 - e0 <= 24) {  // insertion sort for small groups
-          for (u64* a = e0 + 1; a < e1; a++) {
-            u64 v = *a;
-            u64* b = a;
-            while (b > e0 && *(b - 1) > v) {
-              *b = *(b - 1);
-              b--;
+        // clicks in (ts, click_id) order: sort (ts, index) keys; equal-ts ties are broken by
+        // click_id where it matters (the credited click)
+        const size_t c0 = coff[L], c1 = coff[L + 1];
+        const size_t nc = c1 - c0;
+        const ClRec* cb = cl.data() + c0;
+        ck.resize(nc);
+        u64* kk = ck.data();
+        for (size_t i = 0; i < nc; i++) kk[i] = ((u64)(cb[i].ts - CWS) << 20) | i;
+        if (nc > (1u << 20) || clk_general) {
+          // general fallback: indices do not fit, sort the records themselves
+          std::sort(cl.begin() + c0, cl.begin() + c1, [](const ClRec& x, const ClRec& y) {
+            if (x.ts != y.ts) return x.ts < y.ts;
+            return strcmpb(x.cid, x.cidn, y.cid, y.cidn) < 0;
+          });
+          for (size_t i = 0; i < nc; i++) kk[i] = i;
+        } else if (nc <= 24) {
+          for (size_t i = 1; i < nc; i++) {
+            const u64 v = kk[i];
+            size_t j = i;
+            while (j > 0 && kk[j - 1] > v) {
+              kk[j] = kk[j - 1];
+              j--;
             }
-            *b = v;
+            kk[j] = v;
           }
         } else {
-          std::sort(e0, e1);
+          std::sort(kk, kk + nc);
         }
-        const size_t c0 = coff[L], c1 = coff[L + 1];
-        if (c1 - c0 > 1) std::sort(cl.begin() + c0, cl.begin() + c1, clk_less);
-        size_t lo = c0, hi = c0;
+        auto cts = [&](size_t i) { return cb[kk[i] & 0xFFFFF].ts; };
+        auto ccamp = [&](size_t i) { return (int)cb[kk[i] & 0xFFFFF].camp; };
+        size_t lo = 0, hi = 0;
         i64 cur_day = INT64_MIN, dsess = 0, devents = 0, drev = 0;
         u32 nslot = nameof[P] ? nameof[P] - 1 : P;
         auto flush = [&]() {
@@ -2005,7 +2092,7 @@ int main() {
         };
         const u64* k = e0;
         while (k < e1) {
-          const u32 srel = (u32)(*k >> 32);
+          const u32 srel = ts_of(*k);
           const i64 s = WS + srel;
           u32 last = srel;
           i64 nev = 0, rev = 0, npur = 0;
@@ -2016,11 +2103,11 @@ int main() {
           }
           const u64* j = k;
           while (j < e1) {
-            u32 tr = (u32)(*j >> 32);
+            u32 tr = ts_of(*j);
             if ((u64)(tr - last) > (u64)GAPMS) break;
             last = tr;
             nev++;
-            u32 pc = (u32)*j;
+            u32 pc = pc_of(*j);
             if (pc > 1) {
               u32 price = pc >> 8, ct = pc & 0xFF;
               npur++;
@@ -2031,16 +2118,16 @@ int main() {
             j++;
           }
           // click window [s - 7d, s]
-          while (hi < c1 && cl[hi].ts <= s) {
-            int cp = (int)cl[hi].camp;
+          while (hi < nc && cts(hi) <= s) {
+            int cp = ccamp(hi);
             if (cnt[cp]++ == 0) {
               pos[cp] = (int)active.size();
               active.push_back(cp);
             }
             hi++;
           }
-          while (lo < hi && cl[lo].ts < s - WEEKMS) {
-            int cp = (int)cl[lo].camp;
+          while (lo < hi && cts(lo) < s - WEEKMS) {
+            int cp = ccamp(lo);
             if (--cnt[cp] == 0) {
               int last_c = active.back();
               active[pos[cp]] = last_c;
@@ -2051,10 +2138,16 @@ int main() {
           }
           int credited = ORGANIC;
           if (hi > lo) {
+            // latest click; on equal ts the smallest click_id
             size_t m = hi - 1;
-            i64 mts = cl[m].ts;
-            while (m > lo && cl[m - 1].ts == mts) m--;
-            credited = (int)cl[m].camp;
+            const i64 mts = cts(m);
+            const ClRec* best = &cb[kk[m] & 0xFFFFF];
+            while (m > lo && cts(m - 1) == mts) {
+              m--;
+              const ClRec* x = &cb[kk[m] & 0xFFFFF];
+              if (strcmpb(x->cid, x->cidn, best->cid, best->cidn) < 0) best = x;
+            }
+            credited = (int)best->camp;
           }
           size_t di = (size_t)(day - DAY0);
           i64* r = cs + ((size_t)credited * NDAYS + di) * 4;
@@ -2069,7 +2162,7 @@ int main() {
         }
         flush();
         while (lo < hi) {
-          int cp = (int)cl[lo].camp;
+          int cp = ccamp(lo);
           if (--cnt[cp] == 0) {
             int last_c = active.back();
             active[pos[cp]] = last_c;
@@ -2077,6 +2170,37 @@ int main() {
             active.pop_back();
           }
           lo++;
+        }
+      };
+      if (radix) {
+        auto ts_of = [&](u64 v) { return (u32)((v >> PB) & tsmask); };
+        auto pc_of = [&](u64 v) {
+          const u32 pay = (u32)(v & ((1ULL << PB) - 1));
+          return pay ? pcp[pay - 1] : 1u;
+        };
+        for (u32 L = 0; L < PSZ; L++)
+          if (off[L + 1] != off[L]) person(L, ev.data() + off[L], ev.data() + off[L + 1], ts_of, pc_of);
+      } else {
+        auto ts_of = [](u64 v) { return (u32)(v >> 32); };
+        auto pc_of = [](u64 v) { return (u32)v; };
+        for (u32 L = 0; L < PSZ; L++) {
+          if (off[L + 1] == off[L]) continue;
+          u64* e0 = ev.data() + off[L];
+          u64* e1 = ev.data() + off[L + 1];
+          if (e1 - e0 <= 24) {  // insertion sort for small groups
+            for (u64* a = e0 + 1; a < e1; a++) {
+              u64 v = *a;
+              u64* b = a;
+              while (b > e0 && *(b - 1) > v) {
+                *b = *(b - 1);
+                b--;
+              }
+              *b = v;
+            }
+          } else {
+            std::sort(e0, e1);
+          }
+          person(L, e0, e1, ts_of, pc_of);
         }
       }
     });
