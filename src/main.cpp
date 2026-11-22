@@ -1913,6 +1913,10 @@ int main() {
     // or too many purchases for PB bits) takes the general path: scatter by person, then sort.
     const int PB = 64 - 31 - PSH;
     const bool radix_ok = (u64)(WE - WS) <= (1ULL << 31) && PB >= 8 && !getenv("SS_TEST_NORADIX");
+    // cache blocking for the per-partition sort: ranges of ~RTGT events (2 x 8 bytes each,
+    // ~0.5 MB, so a range's sort stays in a 1 MB L2), used when a partition holds over RSPLIT
+    size_t RTGT = 32768, RSPLIT = 49152;
+    if ((env = getenv("SS_TEST_RTGT"))) RTGT = RSPLIT = (size_t)atol(env);
     const bool clk_general = (u64)(WE - CWS) >= (1ULL << 44) || getenv("SS_TEST_CLKSORT");  // tests: force fallbacks
     struct TL {
       vector<u32> off, fill;
@@ -1925,6 +1929,7 @@ int main() {
       vector<i64> catsum;
       vector<int> cattouched;
       vector<u32> h0, h1, h2;
+      vector<u32> rl, rid, rpos;  // cache-blocking ranges
     };
     vector<TL> tls(NT);
     for (auto& tl : tls) {
@@ -1948,61 +1953,97 @@ int main() {
       ev.resize(ne);
       bool radix = radix_ok;
       if (radix) {
-        auto& h0 = tl.h0;
-        auto& h1 = tl.h1;
-        auto& h2 = tl.h2;
-        h0.assign(2048, 0);
-        h1.assign(2048, 0);
-        h2.assign(512, 0);
         pcv.clear();
         const u64 pmax = (1ULL << PB) - 1;
         u64* a = ev.data();
-        size_t i = 0;
         u32* o1 = off.data() + 1;
-        for (int k = 0; k < NT; k++)
-          sp[k][q].each([&](const SEv& e) {
-            const u32 L = e.person & PM;
-            u64 pay = 0;
-            if (e.pc != 1) {
-              pcv.push_back(e.pc);
-              pay = pcv.size();
-            }
-            const u32 ts = e.ts_rel;
-            a[i++] = ((u64)L << (31 + PB)) | ((u64)ts << PB) | pay;
-            h0[ts & 2047]++;
-            h1[(ts >> 11) & 2047]++;
-            h2[ts >> 22]++;
-            o1[L]++;
-          });
+        // Cache blocking: a large partition is first split by person into ranges of about RTGT
+        // events (one counting pass + one scatter), and each range is then sorted on its own.
+        vector<u32>& rl = tl.rl;  // range r holds persons [rl[r], rl[r + 1])
+        rl.clear();
+        auto key = [&](const SEv& e) {
+          u64 pay = 0;
+          if (e.pc != 1) {
+            pcv.push_back(e.pc);
+            pay = pcv.size();
+          }
+          return ((u64)(e.person & PM) << (31 + PB)) | ((u64)e.ts_rel << PB) | pay;
+        };
+        if (ne <= RSPLIT) {
+          size_t i = 0;
+          for (int k = 0; k < NT; k++)
+            sp[k][q].each([&](const SEv& e) {
+              a[i++] = key(e);
+              o1[e.person & PM]++;
+            });
+          for (u32 l = 0; l < PSZ; l++) off[l + 1] += off[l];
+          rl.push_back(0);
+          rl.push_back(PSZ);
+        } else {
+          for (int k = 0; k < NT; k++) sp[k][q].each([&](const SEv& e) { o1[e.person & PM]++; });
+          for (u32 l = 0; l < PSZ; l++) off[l + 1] += off[l];
+          auto& rid = tl.rid;
+          rid.resize(PSZ);
+          rl.push_back(0);
+          for (u32 l = 0; l < PSZ; l++) {
+            if (off[l] - off[rl.back()] >= RTGT && off[l + 1] != off[l]) rl.push_back(l);
+            rid[l] = (u32)rl.size() - 1;
+          }
+          rl.push_back(PSZ);
+          auto& rpos = tl.rpos;
+          rpos.resize(rl.size());
+          for (size_t r = 0; r + 1 < rl.size(); r++) rpos[r] = off[rl[r]];
+          u32* rp = rpos.data();
+          const u32* ri = rid.data();
+          for (int k = 0; k < NT; k++)
+            sp[k][q].each([&](const SEv& e) { a[rp[ri[e.person & PM]]++] = key(e); });
+        }
         if (pcv.size() > pmax) {
           radix = false;
           off.assign(PSZ + 1, 0);
         } else {
-          for (u32 l = 0; l < PSZ; l++) off[l + 1] += off[l];
           auto& ev2 = tl.ev2;
           ev2.resize(ne);
           u64* b = ev2.data();
-          auto pass = [&](u64* src, u64* dst, vector<u32>& h, int sh, u64 mask) {
-            u32 sum = 0;
+          auto& h0 = tl.h0;
+          auto& h1 = tl.h1;
+          auto& h2 = tl.h2;
+          auto pass = [&](const u64* src, u64* dst, size_t n, vector<u32>& h, u32 base, int sh, u64 mask) {
+            u32 sum = base;
             for (auto& c : h) {
               const u32 x = c;
               c = sum;
               sum += x;
             }
             u32* hp = h.data();
-            for (size_t j = 0; j < ne; j++) {
+            for (size_t j = 0; j < n; j++) {
               const u64 v = src[j];
               dst[hp[(v >> sh) & mask]++] = v;
             }
           };
-          pass(a, b, h0, PB, 2047);
-          pass(b, a, h1, PB + 11, 2047);
-          pass(a, b, h2, PB + 22, 511);  // ts < 2^31: 9 bits left
           fill.assign(off.begin(), off.end() - 1);
           u32* fp = fill.data();
-          for (size_t j = 0; j < ne; j++) {
-            const u64 v = b[j];
-            a[fp[v >> (31 + PB)]++] = v;
+          for (size_t r = 0; r + 1 < rl.size(); r++) {
+            const u32 s0 = off[rl[r]], s1 = off[rl[r + 1]];
+            const size_t n = s1 - s0;
+            if (!n) continue;
+            h0.assign(2048, 0);
+            h1.assign(2048, 0);
+            h2.assign(512, 0);
+            for (size_t j = s0; j < s1; j++) {
+              const u32 ts = (u32)(a[j] >> PB);  // low 31 bits are ts (the L bits sit above)
+              h0[ts & 2047]++;
+              h1[(ts >> 11) & 2047]++;
+              h2[(ts >> 22) & 511]++;
+            }
+            // ts digits (absolute positions s0..s1 in both arrays), then the stable person pass
+            pass(a + s0, b, n, h0, s0, PB, 2047);
+            pass(b + s0, a, n, h1, s0, PB + 11, 2047);
+            pass(a + s0, b, n, h2, s0, PB + 22, 511);  // ts < 2^31: 9 bits left
+            for (size_t j = s0; j < s1; j++) {
+              const u64 v = b[j];
+              a[fp[v >> (31 + PB)]++] = v;
+            }
           }
         }
       }
