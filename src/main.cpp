@@ -916,7 +916,6 @@ struct BList {
   };
   Block* head = nullptr;
   Block* tail = nullptr;
-  size_t total = 0;
   inline void push(const T& v, Arena& a) {
     push_with(v, [&]() { return a.alloc(sizeof(Block)); });
   }
@@ -933,9 +932,12 @@ struct BList {
       tail = b;
     }
     tail->items[tail->n++] = v;
-    total++;
   }
-  size_t size() const { return total; }
+  size_t size() const {  // walks the blocks (no per-push counter)
+    size_t n = 0;
+    for (const Block* b = head; b; b = b->next) n += b->n;
+    return n;
+  }
   // hand every block to the arena's free list; the list must not be used afterwards
   void recycle_into(Arena& a) {
     static_assert(sizeof(Block) >= RECYCLE_MIN, "block too small to recycle");
@@ -945,7 +947,6 @@ struct BList {
       b = nx;
     }
     head = tail = nullptr;
-    total = 0;
   }
   template <class F>
   inline void each(F&& f) const {
@@ -1816,7 +1817,6 @@ int main() {
             b = nx;
           }
           evp[k][p].head = evp[k][p].tail = nullptr;
-          evp[k][p].total = 0;
         }
       });
     }
