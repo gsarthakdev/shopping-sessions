@@ -2049,7 +2049,8 @@ int main() {
         ck.resize(nc);
         u64* kk = ck.data();
         for (size_t i = 0; i < nc; i++) kk[i] = ((u64)(cb[i].ts - CWS) << 20) | i;
-        if (nc > (1u << 20) || clk_general) {
+        const bool kts = !(nc > (1u << 20) || clk_general);  // keys hold (ts - CWS) << 20 | index
+        if (!kts) {
           // general fallback: indices do not fit, sort the records themselves
           std::sort(cl.begin() + c0, cl.begin() + c1, [](const ClRec& x, const ClRec& y) {
             if (x.ts != y.ts) return x.ts < y.ts;
@@ -2069,8 +2070,9 @@ int main() {
         } else {
           std::sort(kk, kk + nc);
         }
-        auto cts = [&](size_t i) { return cb[kk[i] & 0xFFFFF].ts; };
-        auto ccamp = [&](size_t i) { return (int)cb[kk[i] & 0xFFFFF].camp; };
+        auto cidx = [&](size_t i) { return kts ? (size_t)(kk[i] & 0xFFFFF) : (size_t)kk[i]; };
+        auto cts = [&](size_t i) { return kts ? CWS + (i64)(kk[i] >> 20) : cb[kk[i]].ts; };
+        auto ccamp = [&](size_t i) { return (int)cb[cidx(i)].camp; };
         size_t lo = 0, hi = 0;
         i64 cur_day = INT64_MIN, dsess = 0, devents = 0, drev = 0;
         u32 nslot = nameof[P] ? nameof[P] - 1 : P;
@@ -2141,10 +2143,10 @@ int main() {
             // latest click; on equal ts the smallest click_id
             size_t m = hi - 1;
             const i64 mts = cts(m);
-            const ClRec* best = &cb[kk[m] & 0xFFFFF];
+            const ClRec* best = &cb[cidx(m)];
             while (m > lo && cts(m - 1) == mts) {
               m--;
-              const ClRec* x = &cb[kk[m] & 0xFFFFF];
+              const ClRec* x = &cb[cidx(m)];
               if (strcmpb(x->cid, x->cidn, best->cid, best->cidn) < 0) best = x;
             }
             credited = (int)best->camp;
