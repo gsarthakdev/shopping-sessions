@@ -1702,36 +1702,71 @@ int main() {
     vector<vector<UList>> su(NT, vector<UList>(PU));
     for (auto& a : sarenas) a.init(evbytes / 2 + (16 << 20));
     {
-      vector<vector<const EvRec*>> tabs(NT);
+      // Table slot: record pointer << 16 | 16 tag bits from h2, so a probe only dereferences a
+      // record on a likely copy. A losing copy is marked in place (pc = 0), and survivors are then
+      // emitted by a sequential pass over the records instead of a random walk through the table.
+      vector<vector<u64>> tabs(NT);
       parallel(PE, [&](int p, int t) {
         size_t n = 0;
         for (int k = 0; k < NT; k++) n += evp[k][p].size();
         size_t sz = 16;
         while (sz < n * 2) sz <<= 1;
         auto& tab = tabs[t];
-        tab.assign(sz, nullptr);
-        u64 m = sz - 1;
+        tab.assign(sz, 0);
+        const u64 m = sz - 1;
+        u64* tb = tab.data();
+        constexpr u32 PF = 16;  // table-slot prefetch distance
         for (int k = 0; k < NT; k++)
-          evp[k][p].each([&](const EvRec& r) {
-            u64 idx = r.hlo & m;
-            for (;;) {
-              const EvRec* q = tab[idx];
-              if (!q) {
-                tab[idx] = &r;
-                break;
+          for (EvList::Block* b = evp[k][p].head; b; b = b->next) {
+            EvRec* it = b->items;
+            const u32 bn = b->n;
+            for (u32 i = 0; i < bn && i < PF; i++) __builtin_prefetch(&tb[it[i].hlo & m]);
+            for (u32 i = 0; i < bn; i++) {
+              if (i + PF < bn) __builtin_prefetch(&tb[it[i + PF].hlo & m]);
+              EvRec& r = it[i];
+              const u64 tag = r.h2 & 0xFFFF;
+              u64 idx = r.hlo & m;
+              for (;;) {
+                const u64 e = tb[idx];
+                if (!e) {
+                  tb[idx] = ((u64)(uintptr_t)&r << 16) | tag;
+                  break;
+                }
+                if ((e & 0xFFFF) == tag) {
+                  EvRec* q = (EvRec*)(uintptr_t)(e >> 16);
+                  if (q->hlo == r.hlo && q->h2 == r.h2) {
+                    if (r.ing < q->ing) {  // equal ingest: keep the first copy seen
+                      q->pc = 0;
+                      tb[idx] = ((u64)(uintptr_t)&r << 16) | tag;
+                    } else {
+                      r.pc = 0;
+                    }
+                    break;
+                  }
+                }
+                idx = (idx + 1) & m;
               }
-              if (q->hlo == r.hlo && q->h2 == r.h2) {
-                if (r.ing < q->ing) tab[idx] = &r;
-                break;
-              }
-              idx = (idx + 1) & m;
             }
-          });
+          }
+        // survivors in record order; each block goes back to the free list once it has been read
         auto& out = su[t];
         Arena& ar = sarenas[t];
-        for (const EvRec* q : tab)
-          if (q && q->pc) out[(q->uh & imask) >> PSH].push(UEv{q->ts_rel, q->pc, q->uh, q->ur}, ar);
-        for (int k = 0; k < NT; k++) evp[k][p].recycle_into(ar);
+        for (int k = 0; k < NT; k++) {
+          EvList::Block* b = evp[k][p].head;
+          while (b) {
+            EvList::Block* nx = b->next;
+            const EvRec* it = b->items;
+            const u32 bn = b->n;
+            for (u32 i = 0; i < bn; i++) {
+              const EvRec& q = it[i];
+              if (q.pc) out[(q.uh & imask) >> PSH].push(UEv{q.ts_rel, q.pc, q.uh, q.ur}, ar);
+            }
+            ar.recycle(b);
+            b = nx;
+          }
+          evp[k][p].head = evp[k][p].tail = nullptr;
+          evp[k][p].total = 0;
+        }
       });
     }
     logt("dedup");
