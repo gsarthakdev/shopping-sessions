@@ -565,39 +565,129 @@ __attribute__((always_inline)) static inline bool parse_ts(const char* p, u32 n,
   for (u32 i = 0; i < n; i++) {
     unsigned c = (unsigned char)p[i] - '0';
     if (c > 9) return false;
-    if (!big) {
-      v = v * 10 + c;
-      if (v > (u64)4e18) big = true;
+    if (!big) {  // checked before the multiply, so v never wraps (v <= INT64_MAX + 2 here)
+      if (v > (u64)INT64_MAX / 10)
+        big = true;
+      else
+        v = v * 10 + c;
     }
   }
-  out = big ? TS_BAD_BIG : (i64)v;
+  out = (big || v > (u64)INT64_MAX) ? TS_BAD_BIG : (i64)v;
   return true;
 }
-// ingest_ts is always valid F1 (rules.md). Fast path: shape check + SWAR digits, returning whole
-// seconds since the epoch; anything that doesn't look like F1 goes through the full parser.
+// 8 digit values (0..9, first digit in the low byte) -> their decimal value. Garbage in, garbage
+// out (no UB) for bytes outside 0..9.
+static inline u64 swar8_val(u64 x) {
+  x = (x * 10) + (x >> 8);
+  return (((x & 0x000000FF000000FFULL) * (100 + (1000000ULL << 32))) +
+          (((x >> 16) & 0x000000FF000000FFULL) * (1 + (10000ULL << 32)))) >> 32;
+}
+// Per (year - TY0) * 32 + month: (days since epoch of the month's 1st - 1) << 8 | days in month.
+// Months 0 and 13..31 have length 0, so every day of them is rejected (no separate month check).
+struct DayMonthTable {
+  int32_t dm[(TY1 - TY0) * 32];
+  DayMonthTable() {
+    for (int y = TY0; y < TY1; y++)
+      for (int m = 0; m < 32; m++)
+        dm[(y - TY0) * 32 + m] =
+            (m >= 1 && m <= 12) ? (int32_t)(((u32)(days_since_epoch(y, m, 1) - 1) << 8) | (u32)dim(y, m)) : 0;
+  }
+};
+static const DayMonthTable g_dm;
+
+// SWAR shape check of a fixed-layout field, by 8-byte word:  x = word ^ t;  bad |= ((x + add) | x) & hi.
+// The pattern has 'd' for a digit, '1'..'5' for a tens digit that may be at most that (month 1,
+// day 3, hour 2, minute / second 5) and any other char for that literal. t holds '0' at digit
+// positions and the literal elsewhere, so after the xor digits are their values and literals are 0;
+// add = 0x80 - (k + 1) makes a byte's high bit set iff x > k (k = 9 digit, the tens limit, or 0 for
+// a literal). A carry out of a byte only happens when that byte fails (x >= 0x81) and only moves
+// upward, so the check is exact. ts_pat gives word w (pattern bytes [8w, 8w + 8)) of:
+// which = 0 template t, 1 add, 2 hi.
+static constexpr u64 ts_pat(const char* pat, int w, int which) {
+  u64 r = 0;
+  for (int i = 0; pat[i]; i++) {
+    if (i / 8 != w) continue;
+    const char ch = pat[i];
+    u64 t = '0', k = 0;
+    if (ch == 'd') k = 9;
+    else if (ch >= '1' && ch <= '5') k = (u64)(ch - '0');
+    else t = (u8)ch;
+    const u64 v = which == 0 ? t : which == 1 ? 0x80 - (k + 1) : 0x80;
+    r |= v << (8 * (i % 8));
+  }
+  return r;
+}
+static constexpr const char TS_F1[] = "dddd-1d-3dT2d:5d:5dZ", TS_F2[] = "dddd-1d-3dT2d:5d:5d+2d:5d",
+                            TS_F3[] = "ddddddddddddd";
+
+// parse_ts for the event/click hot loops: same contract, for a field whose start has 32 readable
+// bytes before lim (fixed-size loads may run past the field; otherwise the general parser runs).
+// One branch splits 13-digit F3 from F1/F2; F1 and F2 share straight-line code (the shape check
+// covers digits, separators and the tens-digit limits; the day / hour checks and the offset are
+// arithmetic), so the only format-dependent branch is n == 13. Anything else (other lengths, an
+// F1/F2-length field failing the shape check, e.g. a 20-digit F3, years outside the month table)
+// takes the general parser. out may also be written when returning false.
+__attribute__((always_inline)) static inline bool parse_ts_fast(const char* p, u32 n, const char* lim, i64& out) {
+  if (__builtin_expect(p + 32 > lim, 0)) return parse_ts(p, n, out);
+  constexpr u64 H = 0x8080808080808080ULL;
+  if (n == 13) {  // F3, 13 digits
+    const u64 a = load8(p) ^ ts_pat(TS_F3, 0, 0), b = load8(p + 8) ^ ts_pat(TS_F3, 1, 0);
+    out = (i64)(swar8_val(a) * 100000 + swar8_val(b << 24));  // b << 24: "000" + digits 8..12
+    return ((((a + ts_pat(TS_F3, 0, 1)) | a) & H) | (((b + ts_pat(TS_F3, 1, 1)) | b) & ts_pat(TS_F3, 1, 2))) == 0;
+  }
+  if (__builtin_expect((n == 20) | (n == 25), 1)) {  // F1 / F2 together
+    // F1/F2 differences are selected by mask; the empty asm keeps gcc from making them a branch
+    u64 m2 = -(u64)(n == 25);
+    asm("" : "+r"(m2));
+    constexpr u64 T1 = ts_pat(TS_F1, 2, 0), T2 = ts_pat(TS_F2, 2, 0), A1 = ts_pat(TS_F1, 2, 1),
+                  A2 = ts_pat(TS_F2, 2, 1);
+    u64 c = load8(p + 16);
+    const u32 neg = (u8)(c >> 24) == '-';  // F2 sign: '-' is checked as '+'
+    c ^= (u64)(neg * 6) << 24;
+    const u64 a = load8(p) ^ ts_pat(TS_F1, 0, 0), b = load8(p + 8) ^ ts_pat(TS_F1, 1, 0);
+    c ^= T1 ^ ((T1 ^ T2) & m2);
+    const u32 e = ((u8)p[24] ^ '0') & (u32)m2;  // F2's last digit, 0 for F1
+    const u64 bad = (((a + ts_pat(TS_F1, 0, 1)) | a) & H) | (((b + ts_pat(TS_F1, 1, 1)) | b) & H) |
+                    (((c + (A1 ^ ((A1 ^ A2) & m2))) | c) & (ts_pat(TS_F1, 2, 2) | m2 & H)) | (e > 9);
+    // separators are 0 after the xor: byte k of t = 10 * digit k + digit k+1
+    const u64 cc = c & (0xFFFFFFFFULL | m2);
+    const u64 ta = a * 10 + (a >> 8), tb = b * 10 + (b >> 8), tc = cc * 10 + (cc >> 8);
+    const u32 yi = (u32)(ta & 0xFF) * 100 + (u32)((ta >> 16) & 0xFF) - TY0;
+    const bool yin = yi < (u32)(TY1 - TY0);
+    const int32_t dm = g_dm.dm[(yin ? yi : 0) * 32 + ((u32)(ta >> 40) & 31)];
+    if (__builtin_expect((bad != 0) | !yin, 0)) return parse_ts(p, n, out);
+    const u32 d = (u32)tb & 0xFF, h = (u32)(tb >> 24) & 0xFF, mi = (u32)(tb >> 48) & 0xFF,
+              s = (u32)(tc >> 8) & 0xFF, oh = (u32)(tc >> 32) & 0xFF, om = (u32)(cc >> 56) * 10 + e;
+    const i64 mneg = -(i64)neg, off = ((i64)(oh * 3600 + om * 60) ^ mneg) - mneg;
+    out = ((i64)((dm >> 8) + (int32_t)d) * 86400 + (i64)(h * 3600 + mi * 60 + s) - off) * 1000;
+    return (d - 1 < (u32)(dm & 0xFF)) & (h < 24) & (oh < 24);
+  }
+  return parse_ts(p, n, out);
+}
+
+// event_type values as little-endian loads
+static constexpr u32 TYPE_VIEW = 'v' | 'i' << 8 | 'e' << 16 | (u32)'w' << 24;
+static constexpr u32 TYPE_CART = 'c' | 'a' << 8 | 'r' << 16 | (u32)'t' << 24;
+static constexpr u64 TYPE_PURCHASE = ('p' | 'u' << 8 | 'r' << 16 | (u64)'c' << 24) |
+                                     ((u64)('h' | 'a' << 8 | 's' << 16 | (u32)'e' << 24) << 32);
+
+// ingest_ts as whole seconds since the epoch. rules.md guarantees it is always valid F1, so a
+// 20-byte field is converted without validation: exact for every valid F1 (years outside the
+// month table go through the full parser), unspecified but memory-safe for anything else.
+// Reads only the field's 20 bytes.
 __attribute__((always_inline)) static inline bool parse_ingest_s(const char* p, u32 n, i64& sec) {
-  if (n == 20 && p[19] == 'Z') {
-    u64 a = load8(p) ^ 0x3030303030303030ULL;
-    u64 b = load8(p + 8) ^ 0x3030303030303030ULL;
-    u32 c;
-    memcpy(&c, p + 16, 4);
-    c ^= 0x30303030u;
-    if (((a & 0xFF0000FF00000000ULL) == 0x1D00001D00000000ULL) &
-        ((b & 0x0000FF0000FF0000ULL) == 0x00000A0000640000ULL) & ((c & 0xFF) == 0x0A) &
-        swar_digits(a, 0x00FFFF00FFFFFFFFULL) & swar_digits(b, 0xFFFF00FFFF00FFFFULL) &
-        swar_digits((u64)c, 0x0000000000FFFF00ULL)) {
-      int y = (int)(a & 0xFF) * 1000 + (int)((a >> 8) & 0xFF) * 100 + (int)((a >> 16) & 0xFF) * 10 +
-              (int)((a >> 24) & 0xFF);
-      int mo = (int)((a >> 40) & 0xFF) * 10 + (int)((a >> 48) & 0xFF);
-      int d = (int)(b & 0xFF) * 10 + (int)((b >> 8) & 0xFF);
-      int h = (int)((b >> 24) & 0xFF) * 10 + (int)((b >> 32) & 0xFF);
-      int mi = (int)((b >> 48) & 0xFF) * 10 + (int)((b >> 56) & 0xFF);
-      int s = (int)((c >> 8) & 0xFF) * 10 + (int)((c >> 16) & 0xFF);
-      if (y >= TY0 && y < TY1 && mo >= 1 && mo <= 12 && d >= 1 && d <= g_mt.len[(y - TY0) * 16 + mo] && h <= 23 &&
-          mi <= 59 && s <= 59) {
-        sec = (i64)(g_mt.first[(y - TY0) * 16 + mo] + d - 1) * 86400 + h * 3600 + mi * 60 + s;
-        return true;
-      }
+  if (__builtin_expect(n == 20, 1)) {
+    u32 c32;
+    memcpy(&c32, p + 16, 4);
+    const u64 a = load8(p) ^ ts_pat(TS_F1, 0, 0), b = load8(p + 8) ^ ts_pat(TS_F1, 1, 0),
+              c = (u64)(c32 ^ (u32)ts_pat(TS_F1, 2, 0));  // separators -> 0
+    const u64 ta = a * 10 + (a >> 8), tb = b * 10 + (b >> 8), tc = c * 10 + (c >> 8);
+    const u32 yi = (u32)(ta & 0xFF) * 100 + (u32)((ta >> 16) & 0xFF) - TY0;
+    if (__builtin_expect(yi < (u32)(TY1 - TY0), 1)) {
+      const int32_t dm = g_dm.dm[yi * 32 + ((u32)(ta >> 40) & 31)];
+      sec = (i64)((dm >> 8) + (int32_t)(tb & 0xFF)) * 86400 +
+            (i64)((u32)((tb >> 24) & 0xFF) * 3600 + (u32)((tb >> 48) & 0xFF) * 60 + (u32)((tc >> 8) & 0xFF));
+      return true;
     }
   }
   i64 ms;
@@ -635,12 +725,14 @@ static bool parse_ts_slow(const char* p, u32 n, i64& out) {
   for (u32 i = 0; i < n; i++) {
     unsigned c = (unsigned char)p[i] - '0';
     if (c > 9) return false;
-    if (!big) {
-      v = v * 10 + c;
-      if (v > (u64)4e18) big = true;
+    if (!big) {  // checked before the multiply, so v never wraps (v <= INT64_MAX + 2 here)
+      if (v > (u64)INT64_MAX / 10)
+        big = true;
+      else
+        v = v * 10 + c;
     }
   }
-  out = big ? TS_BAD_BIG : (i64)v;
+  out = (big || v > (u64)INT64_MAX) ? TS_BAD_BIG : (i64)v;
   return true;
 }
 
@@ -1686,21 +1778,31 @@ int main() {
           r.h2 = h2;
           r.hlo = (u32)h;
           const u32 part = (u32)(h >> (64 - PE_BITS));
-          i64 ings;
-          const bool ingok = parse_ingest_s(f[3].p, f[3].n, ings) && ings >= 0 && ings < (i64)UINT32_MAX;
+          i64 ings = 0;
+          const bool ingok = parse_ingest_s(f[3].p, f[3].n, ings) & (ings >= 0) & (ings < (i64)UINT32_MAX);
           r.ing = ingok ? (u32)ings : UINT32_MAX;
           const i64 ing = ings * 1000;
           r.pc = 0;
           r.ts_rel = 0;
           r.uh = 0;
           r.ur = 0;
-          i64 ts;
-          if (ingok && f[1].n && f[5].n && parse_ts(f[2].p, f[2].n, ts) && ts >= WS && ts < WE && ing - ts <= DAYMS) {
-            u32 pc = 0;
-            const char* tp = f[4].p;
-            if (f[4].n == 4) {
-              if (memcmp(tp, "view", 4) == 0 || memcmp(tp, "cart", 4) == 0) pc = 1;
-            } else if (f[4].n == 8 && memcmp(tp, "purchase", 8) == 0) {
+          // validation as one predictable branch: every check is computed, then and-ed
+          i64 ts = 0;
+          const bool tsok = parse_ts_fast(f[2].p, f[2].n, ce, ts);
+          const char* tp = f[4].p;
+          const u32 tn = f[4].n;
+          u64 tw = 0;
+          if (__builtin_expect(tp + 8 <= ce, 1))
+            tw = load8(tp);
+          else
+            memcpy(&tw, tp, tn < 8 ? tn : 8);
+          const bool vc = (tn == 4) & (((u32)tw == TYPE_VIEW) | ((u32)tw == TYPE_CART));
+          const bool pu = (tn == 8) & (tw == TYPE_PURCHASE);
+          if (ingok & (f[1].n != 0) & (f[5].n != 0) & tsok & (ts >= WS) & (ts < WE) & (ing - ts <= DAYMS) &
+              (vc | pu)) {
+            u32 pc = 1;
+            if (pu) {
+              pc = 0;
               const char* pp = f[6].p;
               u32 pn = f[6].n;
               bool ok = pn > 0;
@@ -1730,8 +1832,9 @@ int main() {
         Arena& ar = carenas[t];
         auto& out = clu[t];
         chunk_lines(c, [&](const char* cb, const char* ce) { scan_lines2<4>(cb, ce, [&](Str* f) {
-          i64 ts;
-          if (f[0].n && f[1].n && parse_ts(f[3].p, f[3].n, ts) && ts >= CWS && ts < WE) {
+          i64 ts = 0;
+          const bool tsok = parse_ts_fast(f[3].p, f[3].n, ce, ts);
+          if ((f[0].n != 0) & (f[1].n != 0) & tsok & (ts >= CWS) & (ts < WE)) {
             int camp = campT.find(f[2].p, f[2].n);
             if (camp >= 0) {
               ClU r;
