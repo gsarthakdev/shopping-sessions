@@ -51,7 +51,7 @@ static int check(std::mt19937_64& rng) {
   }
   buf += '\n';
   // pad so reads past the end stay in our buffer
-  string padded = string(64, '\n') + buf + string(64, '\0');
+  string padded = string(63, '\n') + string(1, (rng() % 2) ? '"' : '\n') + buf + string(64, '\0');
   const char* b = padded.data() + 64;
   const char* e = b + buf.size();
   vector<string> a, c, r;
