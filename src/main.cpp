@@ -1472,7 +1472,11 @@ int main() {
   int PE_BITS = 8;
   while (PE_BITS < 12 && (est_events >> PE_BITS) > 120000) PE_BITS++;
   const int PE = 1 << PE_BITS;
-  const int PU = 256;  // person partitions: top 8 bits of the ID-table slot
+  // person partitions (top PU_BITS bits of the ID-table slot); more partitions make the dedup
+  // scatter slower than they make the per-partition session sorts faster (SS_PU_BITS: experiments)
+  int PU_BITS = 8;
+  if ((env = getenv("SS_PU_BITS"))) PU_BITS = atoi(env);
+  const int PU = 1 << PU_BITS;
 
   // ID table sizing; retried with doubled capacity on overflow.
   // (generator: ~1 distinct ID per 13 events, ~80 bytes per event line, ~20 bytes per link line)
@@ -1496,7 +1500,7 @@ int main() {
   int PSH = 0;  // person partition = slot >> PSH
   for (int attempt = 0;; attempt++) {
     ids.init(cap);
-    PSH = __builtin_ctzll(cap) - 8;
+    PSH = __builtin_ctzll(cap) - PU_BITS;
     logt("ids init");
     // ---- links
     // a link between two distinct IDs, with each ID's first 8 bytes (big-endian, zero-padded): when

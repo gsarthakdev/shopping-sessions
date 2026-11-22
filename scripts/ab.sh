@@ -7,7 +7,7 @@ shift 2
 for r in $(seq 1 "$ROUNDS"); do
   for im in "$@"; do
     out=$(docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m --tmpfs /output:rw,mode=1777 \
-      --cpus 8 --memory 12g --user 1000:1000 -v big20:/data:ro -e NCPU="$NCPU" "$im" 2>&1 | tr '\n' ' ')
+      --cpus 8 --memory ${MEM:-12g} --user 1000:1000 -v ${VOL:-big20}:/data:ro -e NCPU="$NCPU" ${EXTRA:-} "$im" 2>&1 | tr '\n' ' ')
     echo "$im $out" | python3 -c '
 import re,sys
 l=sys.stdin.read(); im=l.split()[0]
